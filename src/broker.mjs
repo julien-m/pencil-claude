@@ -75,18 +75,15 @@ export async function startBroker({ token = randomUUID(), timeout, draftRoot, sa
         peer.send(JSON.stringify({ kind: 'config', ...config }));
         peer.send(JSON.stringify({ kind: 'activity', status: sessions.status(id) }));
       } catch (e) { peer.send(JSON.stringify({ kind: 'fatal', message: e.message })); peer.close(); return; }
-      let storageTail = Promise.resolve();
       peer.on('message', bytes => {
         try {
           const message = JSON.parse(bytes.toString());
           if (message.kind === 'response') sessions.reply(id, generation, message);
           else if (message.kind === 'storage') {
-            storageTail = storageTail.then(async () => {
-              try {
-                const payload = await sessions.storage(id, generation, message.method, message.payload);
-                peer.send(JSON.stringify({ kind: 'storage-response', id: message.id, payload })); broadcast(id);
-              } catch (e) { if (peer.readyState === 1) peer.send(JSON.stringify({ kind: 'storage-response', id: message.id, error: { code: e.code ?? 'STORAGE_ERROR', message: e.message } })); }
-            }).catch(() => {});
+            // Registered synchronously, in channel order: the sessions layer persists them one by one.
+            sessions.storage(id, generation, message.method, message.payload).then(
+              payload => { if (peer.readyState === 1) peer.send(JSON.stringify({ kind: 'storage-response', id: message.id, payload })); broadcast(id); },
+              e => { if (peer.readyState === 1) peer.send(JSON.stringify({ kind: 'storage-response', id: message.id, error: { code: e.code ?? 'STORAGE_ERROR', message: e.message } })); });
           }
         } catch { peer.close(1008, 'Invalid message'); }
       });

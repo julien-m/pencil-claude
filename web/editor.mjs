@@ -30,9 +30,8 @@ function start(editor) {
     const m = JSON.parse(event.data);
     if (m.kind === 'activity') {
       const agents = m.status.agents ?? [];
-      document.querySelector('#activity').textContent = agents.length
-        ? `● ${agents.map(a => a.inFlight ? `${a.agent} (working)` : a.agent).join(' · ')} — ${agents.length} agent${agents.length > 1 ? 's' : ''} on this document`
-        : 'No agent on this document';
+      const list = agents.map(a => `● ${a.agent} · ${a.activeCalls ? `${a.activeCalls} call${a.activeCalls > 1 ? 's' : ''} running` : 'idle'}`).join('   |   ');
+      document.querySelector('#activity').textContent = (agents.length ? `${agents.length} agent${agents.length > 1 ? 's' : ''}: ${list}` : 'No agent on this document') + (m.status.saving ? '   ·   saving…' : '');
       return;
     }
     if (m.kind === 'fatal') { show(m.message); return; }

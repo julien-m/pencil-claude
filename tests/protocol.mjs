@@ -28,13 +28,20 @@ try {
   assert(JSON.parse(await fs.readFile(path.join(dir, 'connection.json'))).pid);
   const status = await client.callTool({ name: 'pencil_status', arguments: { sessionId: opened.structuredContent.sessionId } });
   assert.equal(status.structuredContent.connected, false);
+  const sessionId = opened.structuredContent.sessionId;
+  const participants = await Promise.all(['A', 'B'].map(agent => client.callTool({ name: 'pencil_begin', arguments: { sessionId, agent } })));
+  assert(participants.every(p => !p.isError));
+  assert.deepEqual((await client.callTool({ name: 'pencil_status', arguments: { sessionId } })).structuredContent.agents.map(a => a.agent), ['A', 'B']);
+  const denied = await client.callTool({ name: 'pencil_open', arguments: { path: file, scope: 'another-session' } });
+  assert(denied.isError && denied.content[0].text.startsWith('DOCUMENT_BUSY'));
+  await Promise.all(participants.map(p => client.callTool({ name: 'pencil_end', arguments: { sessionId, lease: p.structuredContent.lease } })));
   // After a service restart the MCP server reconnects instead of failing with a refused connection.
   const first = JSON.parse(await fs.readFile(path.join(dir, 'connection.json'))); process.kill(first.pid, 'SIGTERM');
   for (let i = 0; i < 100; i++) { try { process.kill(first.pid, 0); await new Promise(r => setTimeout(r, 20)); } catch { break; } }
   const after = await client.callTool({ name: 'pencil_status', arguments: { sessionId: opened.structuredContent.sessionId } });
   assert(after.isError && after.content[0].text.startsWith('SESSION_NOT_FOUND'), after.content[0].text);
   assert.notEqual(JSON.parse(await fs.readFile(path.join(dir, 'connection.json'))).pid, first.pid);
-  console.log('MCP stdio: tool-driven opening, local view, UI resource/CSP, CLAUDE_PLUGIN_DATA, service restart, session open/status passed');
+  console.log('MCP stdio: tool-driven opening, local view, UI resource/CSP, CLAUDE_PLUGIN_DATA, shared session and DOCUMENT_BUSY, service restart, session open/status passed');
 } finally {
   clearTimeout(timer); await client.close();
   try { const c = JSON.parse(await fs.readFile(path.join(dir, 'connection.json'))); process.kill(c.pid, 'SIGTERM'); } catch {}

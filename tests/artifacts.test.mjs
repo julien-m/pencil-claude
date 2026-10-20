@@ -4,6 +4,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { createDocument, writeNewFile } from '../src/artifacts.mjs';
 import { Sessions } from '../src/sessions.mjs';
+import { attachEngine } from './fake-engine.mjs';
 let directory;
 beforeEach(async () => { directory = await fs.mkdtemp(path.join(os.tmpdir(), 'pencil-files-')); });
 afterEach(async () => { await fs.rm(directory, { recursive: true, force: true }); });
@@ -11,7 +12,7 @@ test('new document and Save As use the chosen directory without overwriting exis
   const original = path.join(directory, 'new.pen'); await createDocument(original);
   await expect(createDocument(original)).rejects.toMatchObject({ code: 'EEXIST' });
   const sessions = new Sessions({ draftRoot: path.join(directory, 'drafts') });
-  const { sessionId } = await sessions.open(original, 's'); const { generation, fileURI } = sessions.attach(sessionId, () => {});
+  const { sessionId } = await sessions.open(original, 's'); const { generation, fileURI } = attachEngine(sessions, sessionId);
   await sessions.storage(sessionId, generation, 'storage-load');
   await sessions.storage(sessionId, generation, 'storage-write', { fileURI, content: 'opaque-saved-snapshot' });
   const { lease } = sessions.acquire(sessionId, 'agent');
@@ -37,7 +38,7 @@ test('exclusive file write does not replace a pre-existing destination', async (
 test('Save replaces the original with the acknowledged draft and keeps a backup', async () => {
   const original = path.join(directory, 'doc.pen'); await fs.writeFile(original, 'v1', { mode: 0o644 });
   const sessions = new Sessions({ draftRoot: path.join(directory, 'data/drafts') });
-  const { sessionId } = await sessions.open(original, 's'); const { generation, fileURI } = sessions.attach(sessionId, () => {});
+  const { sessionId } = await sessions.open(original, 's'); const { generation, fileURI } = attachEngine(sessions, sessionId);
   await sessions.storage(sessionId, generation, 'storage-load');
   await sessions.storage(sessionId, generation, 'storage-write', { fileURI, content: 'v2' });
   const { lease } = sessions.acquire(sessionId, 'agent');
@@ -55,7 +56,7 @@ test('Save replaces the original with the acknowledged draft and keeps a backup'
 test('Save refuses when the original changed on disk or without a reservation', async () => {
   const original = path.join(directory, 'doc.pen'); await fs.writeFile(original, 'v1');
   const sessions = new Sessions({ draftRoot: path.join(directory, 'data/drafts') });
-  const { sessionId } = await sessions.open(original, 's'); const { generation, fileURI } = sessions.attach(sessionId, () => {});
+  const { sessionId } = await sessions.open(original, 's'); const { generation, fileURI } = attachEngine(sessions, sessionId);
   await sessions.storage(sessionId, generation, 'storage-load');
   await sessions.storage(sessionId, generation, 'storage-save-draft', { fileURI, content: 'agent-edit' });
   await expect(sessions.save(sessionId, 'no-lease')).rejects.toMatchObject({ code: 'INVALID_LEASE' });

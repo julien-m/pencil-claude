@@ -3814,6 +3814,7 @@ var Sessions = class {
   get(id) {
     return this.items.get(id) ?? fail("SESSION_NOT_FOUND", "Unknown session");
   }
+  // Exclusivity is between design sessions: a document belongs to exactly one session.
   async open(filename, scope) {
     if (!path2.isAbsolute(filename) || path2.extname(filename).toLowerCase() !== ".pen") fail("INVALID_PATH", "An absolute .pen file path is required");
     const file = await fs2.realpath(filename);
@@ -3827,14 +3828,54 @@ var Sessions = class {
     }
     const id = randomUUID2();
     const draft = path2.join(this.draftRoot, `${digest(`${scope}:${file}`)}.pen`);
-    const s = { id, scope, file, draft, exportJobs: /* @__PURE__ */ new Map(), writeEpoch: 0, virtualRoot: `pencil/${id}/`, generation: 0, pending: /* @__PURE__ */ new Map(), leases: /* @__PURE__ */ new Map(), flights: /* @__PURE__ */ new Set(), saveWaiters: /* @__PURE__ */ new Set(), blocked: false, connected: false, savedHash: null, operations: 0, recoveries: 0, saveState: "not-loaded" };
+    const s = {
+      id,
+      scope,
+      file,
+      draft,
+      exportJobs: /* @__PURE__ */ new Map(),
+      virtualRoot: `pencil/${id}/`,
+      generation: 0,
+      pending: /* @__PURE__ */ new Map(),
+      participants: /* @__PURE__ */ new Map(),
+      flights: /* @__PURE__ */ new Set(),
+      saving: null,
+      persistTail: Promise.resolve(),
+      coverageWaiters: /* @__PURE__ */ new Set(),
+      recent: [],
+      // mutations counts completed mutating calls; savedThrough is the highest count a persisted snapshot is known to contain.
+      mutations: 0,
+      savedThrough: 0,
+      blocked: false,
+      connected: false,
+      savedHash: null,
+      operations: 0,
+      recoveries: 0,
+      saveState: "not-loaded"
+    };
     this.items.set(id, s);
     return this.status(id);
   }
   status(id) {
     const s = this.get(id);
-    const agents = [...s.leases.values()].map(({ agent, inFlight }) => ({ agent, inFlight }));
-    return { sessionId: s.id, scope: s.scope, name: path2.basename(s.file), connected: s.connected, generation: s.generation, blocked: s.blocked, agents, inFlight: s.flights.size, operations: s.operations, recoveries: s.recoveries, saveState: s.saveState, draftPath: s.draft };
+    const agents = [...s.participants.values()].map(({ agent, activeCalls }) => ({ agent, activeCalls }));
+    return {
+      sessionId: s.id,
+      scope: s.scope,
+      name: path2.basename(s.file),
+      connected: s.connected,
+      generation: s.generation,
+      blocked: s.blocked,
+      agents,
+      activeCalls: s.flights.size,
+      saving: !!s.saving,
+      operations: s.operations,
+      recoveries: s.recoveries,
+      saveState: s.saveState,
+      unsavedMutations: Math.max(0, s.mutations - s.savedThrough),
+      draftPath: s.draft,
+      recentCalls: s.recent.slice(-20)
+    };
   }
   attach(id, send) {
     const s = this.get(id);
@@ -3857,73 +3898,74 @@ var Sessions = class {
     if (s.pending.size) s.blocked = true;
     s.pending.clear();
   }
-  // Exclusivity belongs to the design session (one per document); each agent gets its own
-  // non-exclusive access to it, so several agents work on the shared document at once.
+  // Inside a session every agent gets its own non-exclusive participation token (the "lease"
+  // field): there is no lock between agents, and one agent leaving never interrupts the others.
   acquire(id, agent) {
     const s = this.get(id);
     if (s.blocked) fail("OUTCOME_UNKNOWN", "Session blocked after an unknown outcome");
     const lease = randomUUID2();
-    s.leases.set(lease, { agent, inFlight: 0 });
+    s.participants.set(lease, { agent, activeCalls: 0 });
     this.onActivity(id);
     return { lease, ...this.status(id) };
   }
   release(id, token) {
-    const s = this.get(id), access2 = s.leases.get(token) ?? fail("INVALID_LEASE", "Invalid access token");
-    if (access2.inFlight) fail("CALLS_IN_FLIGHT", "This agent still has calls in progress");
-    s.leases.delete(token);
+    const s = this.get(id), participant = this.participant(s, token);
+    if (participant.activeCalls) fail("CALLS_IN_FLIGHT", "This agent still has calls in progress");
+    s.participants.delete(token);
     this.onActivity(id);
     return this.status(id);
   }
-  access(s, token) {
-    return s.leases.get(token) ?? fail("INVALID_LEASE", "Call pencil_begin before calling tools");
+  participant(s, token) {
+    return s.participants.get(token) ?? fail("INVALID_LEASE", "Call pencil_begin to join the session before calling tools");
   }
-  // Calls are sent immediately, without a session-wide queue; each request carries its own
-  // correlation id, so responses may arrive in any order.
+  // Calls go to the channel immediately, without a session-wide queue: each request has its
+  // own correlation id, so responses may come back in any order. Only a save in progress holds
+  // new calls back, briefly, until its flush and write are done.
   async call(id, token, name, args = {}, { observational = false } = {}) {
-    const s = this.get(id), access2 = this.access(s, token);
+    const s = this.get(id);
+    this.participant(s, token);
     if (!["execute", "read_skill", "get_style", "get_app_state"].includes(name)) fail("TOOL_NOT_ALLOWED", "Tool not exposed by this plugin");
     if (name === "execute" && /\bGenerate\s*\(/.test(args.input ?? "")) fail("ASYNC_UNSUPPORTED", "Asynchronous generation is not supported in this version");
+    while (s.saving) await s.saving;
+    const participant = this.participant(s, token);
     if (s.blocked) fail("OUTCOME_UNKNOWN", "Session blocked; do not replay mutations");
-    const writeEpoch = s.writeEpoch;
-    const flight = this.request(id, "mcp-tool-call", { name, arguments: args });
-    const settled = flight.catch(() => {
+    const mutating = name === "execute" && !observational;
+    const entry = { requestId: randomUUID2(), agent: participant.agent, tool: name, mutating, sentAt: (/* @__PURE__ */ new Date()).toISOString(), settledAt: null, outcome: "pending" };
+    const flight = this.request(id, "mcp-tool-call", { name, arguments: args }, entry.requestId);
+    const settled = flight.then(() => {
+    }, () => {
     });
     s.flights.add(settled);
-    access2.inFlight += 1;
+    participant.activeCalls += 1;
+    s.recent.push(entry);
+    if (s.recent.length > 100) s.recent.shift();
     this.onActivity(id);
     try {
       const response = await flight;
       s.operations += 1;
-      if (name === "execute" && !observational && s.writeEpoch === writeEpoch) s.saveState = "check-required";
+      entry.outcome = response?.isError ? "engine-error" : "ok";
+      if (mutating) {
+        s.mutations += 1;
+        this.refreshSaveState(s);
+      }
       return response;
+    } catch (error) {
+      entry.outcome = error.code ?? "error";
+      throw error;
     } finally {
+      entry.settledAt = (/* @__PURE__ */ new Date()).toISOString();
       s.flights.delete(settled);
-      access2.inFlight -= 1;
+      participant.activeCalls -= 1;
       this.onActivity(id);
     }
   }
-  // Save waits only for the operations in flight when it is requested, then for the engine's
-  // autosave of their result (bounded by saveWait), and never blocks new calls.
-  async settle(s) {
-    await Promise.all([...s.flights]);
-    if (s.saveState === "check-required") {
-      await new Promise((resolve) => {
-        const waiter = () => {
-          clearTimeout(timer);
-          s.saveWaiters.delete(waiter);
-          resolve();
-        };
-        const timer = setTimeout(waiter, this.saveWait);
-        s.saveWaiters.add(waiter);
-      });
-    }
-    if (s.blocked) fail("OUTCOME_UNKNOWN", "An operation has an unknown outcome; reload the view before saving");
-    if (s.saveState !== "draft-saved" && s.saveState !== "host-saved") fail("SAVE_NOT_READY", `No engine save acknowledged (saveState: ${s.saveState})`);
+  refreshSaveState(s) {
+    if (s.saveState === "not-loaded" || s.saveState === "conflict") return;
+    s.saveState = s.savedThrough >= s.mutations ? "draft-saved" : "check-required";
   }
-  request(id, method, payload) {
+  request(id, method, payload, requestId = randomUUID2()) {
     const s = this.get(id);
     if (!s.connected) fail("EDITOR_OFFLINE", "Open the editor view for this session and wait for the engine");
-    const requestId = randomUUID2();
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         s.pending.delete(requestId);
@@ -3986,72 +4028,167 @@ var Sessions = class {
       s.exportJobs.delete(prefix);
     }
   }
-  async saveAs(id, token, filename) {
+  // Save and Save As: wait for the calls in flight, hold new calls back, ask the engine to flush
+  // (or wait for its autosave), check that the persisted snapshot covers every completed
+  // mutation, then write. Agents stay joined throughout.
+  async consistent(id, token, write) {
     const s = this.get(id);
-    this.access(s, token);
-    if (path2.extname(filename).toLowerCase() !== ".pen") fail("INVALID_PATH", "Choose a new .pen file");
-    await this.settle(s);
-    const saved = await writeNewFile(filename, await fs2.readFile(s.draft));
-    return { path: saved, sessionId: id, sourceUnchanged: true };
-  }
-  // Replace the original with the acknowledged draft, only if nobody changed it since the engine loaded it.
-  // The previous version is kept in backups/ first; a final hash check runs right before the atomic rename.
-  async save(id, token) {
-    const s = this.get(id);
-    this.access(s, token);
-    await this.settle(s);
-    const unchanged = async () => s.savedHash !== null && digest(await fs2.readFile(s.file)) === s.savedHash;
-    const conflict = () => {
-      s.saveState = "conflict";
-      fail("SAVE_CONFLICT", "The original file changed since it was loaded; nothing was replaced. Use Save As");
-    };
-    if (!await unchanged()) conflict();
-    const bytes = await fs2.readFile(s.draft), previous = await fs2.readFile(s.file);
-    const backups = path2.join(path2.dirname(this.draftRoot), "backups");
-    await fs2.mkdir(backups, { recursive: true, mode: 448 });
-    const stamp = (/* @__PURE__ */ new Date()).toISOString().replace(/[:.]/g, "-");
-    const backupPath = await writeNewFile(path2.join(backups, `${path2.basename(s.file, ".pen")}-${stamp}-${randomUUID2().slice(0, 8)}.pen`), previous);
-    const temp = path2.join(path2.dirname(s.file), `.${path2.basename(s.file)}.${randomUUID2()}.tmp`);
+    this.participant(s, token);
+    while (s.saving) await s.saving;
+    let open2;
+    s.saving = new Promise((resolve) => {
+      open2 = resolve;
+    });
+    this.onActivity(id);
     try {
-      await fs2.writeFile(temp, bytes, { flag: "wx", mode: (await fs2.stat(s.file)).mode & 511 });
-      if (!await unchanged()) conflict();
-      await fs2.rename(temp, s.file);
+      await Promise.all([...s.flights]);
+      if (s.blocked) fail("OUTCOME_UNKNOWN", "An operation has an unknown outcome; reload the view before saving");
+      const flush = await this.flush(s);
+      await s.persistTail;
+      if (s.savedThrough < s.mutations) fail("SAVE_NOT_READY", `The engine did not persist ${s.mutations - s.savedThrough} completed change(s); nothing was written`);
+      return { ...await this.persist(s, () => write(s)), flush };
     } finally {
-      await fs2.unlink(temp).catch(() => {
-      });
+      s.saving = null;
+      open2();
+      this.onActivity(id);
     }
-    s.savedHash = digest(bytes);
-    return { path: s.file, backupPath, sessionId: id, bytes: bytes.length };
   }
-  async storage(id, generation, method, payload) {
-    const s = this.get(id);
+  async flush(s) {
+    const through = s.mutations;
+    let flushed = false, answer;
+    try {
+      answer = await this.request(s.id, "save");
+      flushed = answer === 0 || answer === 1;
+    } catch (error) {
+      if (error.code !== "EDITOR_ERROR") throw error;
+      answer = `error: ${error.message}`;
+    }
+    await s.persistTail;
+    if (flushed && s.saveState !== "not-loaded") {
+      s.savedThrough = Math.max(s.savedThrough, through);
+      this.refreshSaveState(s);
+      return { method: "engine-flush", answer };
+    }
+    if (s.savedThrough >= s.mutations) return { method: "autosave", answer };
+    await new Promise((resolve) => {
+      const waiter = () => {
+        if (s.savedThrough < s.mutations) return;
+        clearTimeout(timer);
+        s.coverageWaiters.delete(waiter);
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        s.coverageWaiters.delete(waiter);
+        resolve();
+      }, this.saveWait);
+      s.coverageWaiters.add(waiter);
+    });
+    return { method: "autosave", answer };
+  }
+  saveAs(id, token, filename) {
+    if (path2.extname(filename).toLowerCase() !== ".pen") fail("INVALID_PATH", "Choose a new .pen file");
+    return this.consistent(id, token, async (s) => {
+      const saved = await writeNewFile(filename, await this.currentBytes(s));
+      return { path: saved, sessionId: id, sourceUnchanged: true };
+    });
+  }
+  async currentBytes(s) {
+    try {
+      return await fs2.readFile(s.draft);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      return fs2.readFile(s.file);
+    }
+  }
+  // Replace the original only if nobody changed it since the engine loaded it. The previous
+  // version is kept in backups/ first; a final hash check runs right before the atomic rename.
+  save(id, token) {
+    return this.consistent(id, token, async (s) => {
+      const unchanged = async () => s.savedHash !== null && digest(await fs2.readFile(s.file)) === s.savedHash;
+      const conflict = () => {
+        s.saveState = "conflict";
+        fail("SAVE_CONFLICT", "The original file changed since it was loaded; nothing was replaced. Use Save As");
+      };
+      if (s.saveState === "conflict" || !await unchanged()) conflict();
+      const bytes = await this.currentBytes(s), previous = await fs2.readFile(s.file);
+      const backups = path2.join(path2.dirname(this.draftRoot), "backups");
+      await fs2.mkdir(backups, { recursive: true, mode: 448 });
+      const stamp = (/* @__PURE__ */ new Date()).toISOString().replace(/[:.]/g, "-");
+      const backupPath = await writeNewFile(path2.join(backups, `${path2.basename(s.file, ".pen")}-${stamp}-${randomUUID2().slice(0, 8)}.pen`), previous);
+      const temp = path2.join(path2.dirname(s.file), `.${path2.basename(s.file)}.${randomUUID2()}.tmp`);
+      try {
+        await fs2.writeFile(temp, bytes, { flag: "wx", mode: (await fs2.stat(s.file)).mode & 511 });
+        if (!await unchanged()) conflict();
+        await fs2.rename(temp, s.file);
+      } finally {
+        await fs2.unlink(temp).catch(() => {
+        });
+      }
+      s.savedHash = digest(bytes);
+      await this.writeBaseline(s);
+      return { path: s.file, backupPath, sessionId: id, bytes: bytes.length };
+    });
+  }
+  persist(s, operation) {
+    const result = s.persistTail.then(operation);
+    s.persistTail = result.then(() => {
+    }, () => {
+    });
+    return result;
+  }
+  writeBaseline(s) {
+    return this.atomicWrite(`${s.draft}.baseline`, Buffer.from(JSON.stringify({ sourceHash: s.savedHash })));
+  }
+  // Storage requests are registered synchronously in arrival order, so a snapshot only covers
+  // the mutations whose responses reached the service before it.
+  storage(id, generation, method, payload) {
+    const s = this.get(id), covers = s.mutations;
+    return this.persist(s, () => this.storageNow(s, generation, method, payload, covers));
+  }
+  async storageNow(s, generation, method, payload, covers) {
     if (generation !== s.generation || !s.connected) fail("STALE_CHANNEL", "Stale channel");
     if (method === "documents-save-preview") return null;
     if (method === "storage-load") {
       let bytes = await fs2.readFile(s.file);
-      s.savedHash = digest(bytes);
+      const sourceHash = digest(bytes);
+      s.savedHash = sourceHash;
       s.saveState = "saved";
       try {
         bytes = await fs2.readFile(s.draft);
-        s.saveState = "draft-saved";
+        try {
+          s.savedHash = JSON.parse(await fs2.readFile(`${s.draft}.baseline`, "utf8")).sourceHash ?? null;
+        } catch (error) {
+          if (error.code !== "ENOENT") throw error;
+          s.savedHash = null;
+        }
+        s.saveState = s.savedHash === sourceHash ? "draft-saved" : "conflict";
       } catch (e) {
         if (e.code !== "ENOENT") throw e;
       }
+      s.savedThrough = s.mutations;
       return { filePath: path2.basename(s.file), content: bytes.toString("utf8"), updatedAt: (await fs2.stat(s.file)).mtimeMs };
     }
     if (method === "storage-write" || method === "storage-save-draft") {
       if (typeof payload?.content !== "string" || Buffer.byteLength(payload.content) > 32 * 1024 * 1024) fail("INVALID_CONTENT", "Invalid content");
       if (payload.fileURI !== `file:///${s.virtualRoot}${encodeURIComponent(path2.basename(s.file))}`) fail("WRONG_DOCUMENT", "Unexpected document URI");
-      if (method === "storage-write" && (s.savedHash === null || digest(await fs2.readFile(s.file)) !== s.savedHash)) {
-        s.saveState = "conflict";
-        return 2;
+      let sourceHash;
+      try {
+        sourceHash = digest(await fs2.readFile(s.file));
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
       }
+      const conflict = s.savedHash === null || sourceHash !== s.savedHash;
       await fs2.mkdir(this.draftRoot, { recursive: true, mode: 448 });
       await this.atomicWrite(s.draft, Buffer.from(payload.content));
-      s.writeEpoch += 1;
-      s.saveState = "draft-saved";
-      for (const waiter of [...s.saveWaiters]) waiter();
-      return 0;
+      await this.writeBaseline(s);
+      s.savedThrough = Math.max(s.savedThrough, covers);
+      if (conflict) s.saveState = "conflict";
+      else {
+        s.saveState = "saved";
+        this.refreshSaveState(s);
+      }
+      for (const waiter of [...s.coverageWaiters]) waiter();
+      return conflict ? 2 : 0;
     }
     if (!["storage-read-asset", "storage-write-asset", "storage-has-asset"].includes(method)) fail("METHOD_NOT_ALLOWED", `Unknown storage operation: ${method}`);
     const key = payload?.path;
@@ -4113,7 +4250,7 @@ var Sessions = class {
 };
 
 // src/version.mjs
-var VERSION = "0.3.0";
+var VERSION = "0.4.0";
 
 // src/broker.mjs
 var same = (a, b) => {
@@ -4217,22 +4354,20 @@ async function startBroker({ token = randomUUID3(), timeout, draftRoot, saveWait
         peer.close();
         return;
       }
-      let storageTail = Promise.resolve();
       peer.on("message", (bytes) => {
         try {
           const message = JSON.parse(bytes.toString());
           if (message.kind === "response") sessions.reply(id, generation, message);
           else if (message.kind === "storage") {
-            storageTail = storageTail.then(async () => {
-              try {
-                const payload = await sessions.storage(id, generation, message.method, message.payload);
-                peer.send(JSON.stringify({ kind: "storage-response", id: message.id, payload }));
+            sessions.storage(id, generation, message.method, message.payload).then(
+              (payload) => {
+                if (peer.readyState === 1) peer.send(JSON.stringify({ kind: "storage-response", id: message.id, payload }));
                 broadcast(id);
-              } catch (e) {
+              },
+              (e) => {
                 if (peer.readyState === 1) peer.send(JSON.stringify({ kind: "storage-response", id: message.id, error: { code: e.code ?? "STORAGE_ERROR", message: e.message } }));
               }
-            }).catch(() => {
-            });
+            );
           }
         } catch {
           peer.close(1008, "Invalid message");

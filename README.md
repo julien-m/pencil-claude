@@ -57,17 +57,31 @@ Ask Claude to use Pencil, for example: “Open /absolute/path/landing.pen in Pen
 1. The agent calls `pencil_open` with an absolute `.pen` path and an explicit `scope`, or `pencil_new` to create a document. It receives a `sessionId` and a `viewUrl`.
 2. The agent (or you) opens `viewUrl`. **Keep the view visible**: a page loaded or left in a hidden pane or background tab may never start the Pencil engine, and calls then time out.
 3. The agent waits until `pencil_status` reports `connected: true`, then loads the native instructions with `pencil_call` → `read_skill`.
-4. Each read/edit/verify sequence is wrapped in `pencil_begin` → `pencil_call` → `pencil_end`.
+4. The agent joins with `pencil_begin`, works with `pencil_call`, and leaves with `pencil_end`.
 5. To collaborate, other agents receive the `sessionId` only and join with `pencil_begin`. They must not open the same file under another `scope` (that is refused with `DOCUMENT_BUSY`).
 
 ### Shared sessions
 
-Exclusivity is held by the **design session**: a document belongs to one session at a time. Inside it, access is **not exclusive**: every agent that calls `pencil_begin` gets its own access token, and all of them work on the document at once.
+**Between sessions, exclusive.** A `.pen` document belongs to exactly one design session. Opening it from another session (another `scope`) is refused with `DOCUMENT_BUSY`.
 
-- Calls are sent to the engine immediately, without a session-wide queue. Each request carries its own correlation id, so responses can arrive in any order and still reach the right agent.
-- Because writes are no longer taken in turns, agents should split the work (for example one screen or one frame each), re-read before editing, and never modify nodes they did not create.
-- `pencil_end` gives back an agent's token; it is refused only while that agent still has calls in flight.
-- `pencil_save` and `pencil_save_as` wait only for the operations already in flight when they are called, then for the engine's autosave of their result (up to 5 s). New calls are not blocked meanwhile.
+**Inside a session, shared.** All agents of a session use the same `sessionId`, the same channel and the same document:
+
+- `pencil_begin` gives each agent its own **non-exclusive participation token** (the `lease` field). There is no lock on the document between agents.
+- `pencil_call` forwards each call to the engine **immediately**, without waiting for another agent's answer and without a session-wide queue. Every request carries its own id, so answers that come back out of order still reach the right agent.
+- `pencil_end` removes one agent (refused only while that agent's own calls are running); the other agents are not interrupted.
+- Split the work: each agent edits its own frames or components, re-reads before editing, and never changes another agent's nodes. **The plugin does not merge contradictory edits to the same object**: the engine applies them in the order it receives them, and the last one wins.
+- The engine's JavaScript globals (variables created by `execute` snippets) are shared by every agent of the session. Use distinct variable names per agent, or none.
+
+**Plugin concurrency vs. engine execution.** Concurrency is a property of the plugin: it sends calls from several agents at once and keeps them in flight together. The hosted Pencil engine then runs `execute` snippets one at a time in its browser thread. Two simultaneous calls therefore overlap in the plugin but complete one after the other inside the engine.
+
+**Consistent saves.** `pencil_save` and `pencil_save_as` keep every agent joined and:
+
+1. wait until the calls already running have answered;
+2. briefly hold back new calls from all agents (they are sent as soon as the save is written; `saving: true` in `pencil_status` meanwhile);
+3. ask the engine to flush its current content (`save` request); if the engine cannot, they wait up to 5 s for an autosave that covers every completed edit;
+4. write only if the persisted snapshot contains **every completed edit**, otherwise answer `SAVE_NOT_READY` and write nothing.
+
+A snapshot only counts as containing an edit if it reaches the service **after** that edit's answer. The engine channel preserves message order, so a snapshot produced while another agent's edit was still running never marks that edit as saved (`unsavedMutations` in `pencil_status` shows the count).
 
 Documents open only through `pencil_open` or `pencil_new`. The plugin does not register any `.pen` file association.
 
@@ -77,20 +91,20 @@ Documents open only through `pencil_open` or `pencil_new`. The plugin does not r
 |---|---|
 | `pencil_open` | Open an existing `.pen` file in a design session; returns `sessionId` and `viewUrl` |
 | `pencil_new` | Create a `.pen` file at a new absolute path (never overwrites), then open it |
-| `pencil_status` | Connection, agents currently in the session with their calls in flight, save state, draft path |
+| `pencil_status` | Connection, agents with their running calls, `saving`, save state, `unsavedMutations`, draft path, and `recentCalls` (agent, tool, request id, sent and answered timestamps) |
 | `pencil_tools` | Native engine tool schemas |
-| `pencil_begin` / `pencil_end` | Join / leave the shared session; each agent gets its own non-exclusive access token |
+| `pencil_begin` / `pencil_end` | Join / leave the shared session; each agent gets its own non-exclusive participation token |
 | `pencil_call` | Call native tools: `execute`, `get_app_state`, `get_style`, `read_skill`. Pass `readOnly: true` for `execute` snippets that only read |
 | `pencil_capture` | PNG captures of node IDs, or `["document"]` for the whole design |
 | `pencil_export` | PNG, JPEG, WEBP, PDF, HTML/CSS or HTML/Tailwind export of the selected nodes |
-| `pencil_save` | Replace the original `.pen` file with the last acknowledged draft; refused if the file changed on disk since it was loaded |
-| `pencil_save_as` | Copy the last acknowledged draft to a new `.pen` file |
+| `pencil_save` | Flush the engine and replace the original `.pen` file; refused if the file changed on disk since it was loaded |
+| `pencil_save_as` | Flush the engine and write a new `.pen` file |
 
-Captures, exports, Save and Save As need an access token. Captures, exports and Save As need an existing absolute destination and never overwrite an existing file; Save is the only tool that replaces a file, and only the session's own original. Exporting HTML/CSS and HTML/Tailwind both write `index.html`, so use separate directories for them. Engine screenshots are small previews; use `pencil_export` for full-resolution images.
+Captures, exports, Save and Save As need a participation token. Captures, exports and Save As need an existing absolute destination and never overwrite an existing file; Save is the only tool that replaces a file, and only the session's own original. Exporting HTML/CSS and HTML/Tailwind both write `index.html`, so use separate directories for them. Engine screenshots are small previews; use `pencil_export` for full-resolution images.
 
 ### Agent activity
 
-The local view shows a badge listing every agent in the session, marking those with calls in flight (for example “● Sub-agent 1 (working) · Sub-agent 2 (working) — 2 agents on this document”), updated over the session channel. The label is chosen by the agent and is not an authenticated identity. The plugin does not create per-agent cursors or presence on the Pencil canvas.
+The local view shows every agent of the session with its activity (for example “2 agents: ● Agent A · 1 call running | ● Agent B · idle”) and “saving…” during a save, updated over the session channel. `pencil_status` also returns `recentCalls` with the timestamps of the last calls. The label is chosen by the agent and is not an authenticated identity. The plugin does not create per-agent cursors or presence on the Pencil canvas.
 
 The page contains the unmodified Pencil editor: layers, components, zoom, Sign In, Goodies and settings stay as Pencil provides them. The plugin adds a two-line header above the editor and never hides or alters Pencil's interface with CSS, DOM injection or overlays.
 
@@ -101,7 +115,7 @@ Claude Code session ──stdio──▶ MCP server (dist/server.mjs, one per se
                                    │ authenticated HTTP RPC on 127.0.0.1
                                    ▼
                      Local service (dist/daemon.mjs, one per user)
-                       • sessions, access tokens, drafts
+                       • sessions, participation tokens, drafts
                        • GET /view/<sessionId>/<grant>  → editor page
                        • WebSocket /editor              → session channel
                                    ▲
@@ -110,7 +124,7 @@ Browser view (127.0.0.1) ──────────┘   iframe: https://app
 ```
 
 - The first MCP server to start spawns the detached local service; later sessions reuse it, which is how agents in different Claude Code sessions share a design session. If the service restarts, MCP servers reconnect automatically on the next call (sessions are then reopened with `pencil_open`).
-- Native tool calls require an access token and are forwarded at once; responses are matched by request id.
+- Native tool calls require a participation token and are forwarded at once; responses are matched by request id.
 - The engine reads and writes the document through the channel; the service never decodes `.pen` contents.
 
 Source: [MCP server](src/server.mjs), [client/service bootstrap](src/client.mjs), [local service](src/broker.mjs), [sessions and storage](src/sessions.mjs), [file outputs](src/artifacts.mjs), [editor view](web/editor.mjs).
@@ -119,9 +133,10 @@ Source: [MCP server](src/server.mjs), [client/service bootstrap](src/client.mjs)
 
 - Private data lives in `${CLAUDE_PLUGIN_DATA}` (by default `~/.claude/plugins/data/pencil-pencil/`), which survives plugin updates and is removed when the plugin is uninstalled from its last scope unless you keep its data. If the variable is absent (development), `PENCIL_DATA` or the plugin's `.runtime/` directory is used.
 - `connection.json` holds the service port, its private token and PID (mode 0600).
-- The engine's autosaves go to `drafts/<hash>.pen`, keyed by scope and file. The original document changes only when an agent calls `pencil_save`. Reopening the same file with the same `scope` reloads the draft, including after a service restart.
-- `pencil_save` requires `saveState` `draft-saved`. It checks that the original still has the content the engine loaded (otherwise `SAVE_CONFLICT`, and nothing is replaced), copies the previous version to `backups/`, then atomically replaces the file, keeping its permissions. A final check runs just before the replacement; a write by another program in that last instant can still be lost, which is why the backup exists.
-- `pencil_save_as` copies the draft to a new file once `saveState` is `draft-saved`. Any `execute` call not marked `readOnly` sets `saveState` to `check-required` until the engine saves again; an edit that changes nothing does not trigger a save.
+- The engine's autosaves go to `drafts/<hash>.pen`, keyed by scope and file, even when the original changed on disk (the work is kept and `saveState` becomes `conflict`). The original document changes only when an agent calls `pencil_save`. Reopening the same file with the same `scope` reloads the draft, including after a service restart.
+- `drafts/<hash>.pen.baseline` records which version of the original the draft was made from, so a restart cannot hide an external change: if the original changed meanwhile, the reopened session is in `conflict` and only Save As is allowed.
+- `pencil_save` follows the consistent-save steps above. It then checks that the original still has the content the engine loaded (otherwise `SAVE_CONFLICT`, and nothing is replaced), copies the previous version to `backups/`, then atomically replaces the file, keeping its permissions. A final check runs just before the replacement; a write by another program in that last instant can still be lost, which is why the backup exists.
+- `pencil_save_as` follows the same steps and writes a new file. Any `execute` call not marked `readOnly` sets `saveState` to `check-required` until a later snapshot covers it.
 - Assets are limited to `images/` and `fonts/` next to the document. Traversal paths, symbolic links and `.pen` files used as assets are rejected.
 
 ## Security
@@ -137,7 +152,10 @@ Verified on macOS with Claude Code 2.1.296, the plugin installed from a local ch
 
 - A design session survived a restart of the local service: reopening the same file with the same scope reloaded both agents' work from the draft; `pencil_save_as` then wrote a new file (a second Save As to the same path was refused) and the original was unchanged.
 - Two Claude Code sessions, each with the installed plugin, created two documents and designed the two login screens shown above at the same time; each view showed its own agent badge, and each draft contained only its own design. `pencil_save` then wrote both designs into their original files and kept backups of the previous versions.
-- Two sub-agents of one Claude Code session joined the same design session and each designed a different screen in the same document at the same time: both were listed together in the session, their calls interleaved without waiting, each saw the other's frame appear while working, and neither touched the other's nodes. A direct probe sent two slow calls from two agents at once: the plugin had both in flight together (`inFlight: 2`), the second answer came back first and each answer reached its own caller.
+- **Shared session, real engine (0.4.0).** Two sub-agents of one Claude Code session joined one design session and each built a different mobile mock-up (a weather screen and a music player) in the same document. Their calls interleaved (A, A, B, B, A, B) and each agent saw the other's frame appear while working. Opening the document from another scope was refused with `DOCUMENT_BUSY`. These agents called the plugin's MCP server through a small command-line MCP client, because Claude Code reloads an updated plugin's tools only at the next user message.
+- **Overlap, from the plugin's own `recentCalls`.** One edit per agent, each in its own mock-up, sent at the same time: both requests left the plugin at 06:50:56.380, before either answer; Agent A's answer arrived at 06:50:57.893 and Agent B's at 06:50:59.400. Inside the engine, the snippets ran one after the other (A 56.392–57.892, B 57.899–59.399). Between the two answers `unsavedMutations` was 2.
+- **Save on the real engine.** `pencil_save` used the engine flush (`engine-flush`, answer `1`), wrote both mock-ups and both simultaneous edits into the original file (200 → 12,361 bytes), kept a backup, and left `unsavedMutations` at 0. Both mock-ups were then captured and exported.
+- In normal agent work, individual calls last 10–100 ms while agents spend seconds between calls, so calls from two working agents rarely overlap in time even though nothing makes them wait.
 - Captures of a component, a screen and the whole document; exports in all six formats; document creation; Save; Save As; layers panel navigation.
 
 Known limits:
@@ -145,6 +163,8 @@ Known limits:
 - No embedded panel in Claude Code (see above); the MCP Apps resource is untested with Claude.
 - The view must stay visible while agents work. An unanswered call times out after 15 s with `OUTCOME_UNKNOWN` and blocks the session. Never replay that mutation: reload the view, which reloads the last saved draft and unblocks the session (`recoveries` increases); then re-read before editing.
 - The plugin forwards calls in parallel, but the hosted Pencil engine runs `execute` snippets one after another: two simultaneous calls overlap in the plugin and complete one after the other in the engine.
+- No automatic merge: two agents editing the same object get last-write-wins from the engine. Engine globals created by `execute` are shared between agents.
+- New calls are held back while a save flushes and writes (normally well under a second).
 - Asynchronous generation (`Generate(...)`) is not supported.
 - External `.pen` libraries and the editor's document-library requests (such as `documents-list`) are not implemented; open and create documents with the plugin tools.
 - Two views of different documents can be open at once. A view that was loaded while visible kept working from a background tab during the test; a view first loaded in a hidden pane did not start the engine.
