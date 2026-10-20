@@ -3963,6 +3963,35 @@ var Sessions = class {
     const saved = await writeNewFile(filename, await fs2.readFile(s.draft));
     return { path: saved, sessionId: id, sourceUnchanged: true };
   }
+  // Replace the original with the acknowledged draft, only if nobody changed it since the engine loaded it.
+  // The previous version is kept in backups/ first; a final hash check runs right before the atomic rename.
+  async save(id, token) {
+    const s = this.get(id);
+    if (s.lease?.token !== token || s.pending.size || s.queued || s.blocked) fail("SAVE_NOT_READY", "Reserve the session and wait for pending operations");
+    if (s.saveState !== "draft-saved" && s.saveState !== "host-saved") fail("SAVE_NOT_READY", "Wait for an engine save acknowledgement before saving");
+    const unchanged = async () => s.savedHash !== null && digest(await fs2.readFile(s.file)) === s.savedHash;
+    const conflict = () => {
+      s.saveState = "conflict";
+      fail("SAVE_CONFLICT", "The original file changed since it was loaded; nothing was replaced. Use Save As");
+    };
+    if (!await unchanged()) conflict();
+    const bytes = await fs2.readFile(s.draft), previous = await fs2.readFile(s.file);
+    const backups = path2.join(path2.dirname(this.draftRoot), "backups");
+    await fs2.mkdir(backups, { recursive: true, mode: 448 });
+    const stamp = (/* @__PURE__ */ new Date()).toISOString().replace(/[:.]/g, "-");
+    const backupPath = await writeNewFile(path2.join(backups, `${path2.basename(s.file, ".pen")}-${stamp}-${randomUUID2().slice(0, 8)}.pen`), previous);
+    const temp = path2.join(path2.dirname(s.file), `.${path2.basename(s.file)}.${randomUUID2()}.tmp`);
+    try {
+      await fs2.writeFile(temp, bytes, { flag: "wx", mode: (await fs2.stat(s.file)).mode & 511 });
+      if (!await unchanged()) conflict();
+      await fs2.rename(temp, s.file);
+    } finally {
+      await fs2.unlink(temp).catch(() => {
+      });
+    }
+    s.savedHash = digest(bytes);
+    return { path: s.file, backupPath, sessionId: id, bytes: bytes.length };
+  }
   async storage(id, generation, method, payload) {
     const s = this.get(id);
     if (generation !== s.generation || !s.connected) fail("STALE_CHANNEL", "Stale channel");
@@ -4052,7 +4081,7 @@ var Sessions = class {
 };
 
 // src/version.mjs
-var VERSION = "0.1.0";
+var VERSION = "0.2.0";
 
 // src/broker.mjs
 var same = (a, b) => {
@@ -4122,6 +4151,7 @@ async function startBroker({ token = randomUUID3(), timeout, draftRoot, editorHt
       } else if (method === "call") result = await sessions.call(args.sessionId, args.lease, args.tool, args.arguments, { observational: args.readOnly === true });
       else if (method === "capture") result = await sessions.capture(args.sessionId, args.lease, args.nodeIds, args.directory);
       else if (method === "export") result = await sessions.exportNodes(args.sessionId, args.lease, args.nodeIds, args.format, args.directory);
+      else if (method === "save") result = await sessions.save(args.sessionId, args.lease);
       else if (method === "save-as") result = await sessions.saveAs(args.sessionId, args.lease, args.path);
       else throw new Error("Unknown broker method");
       res.end(JSON.stringify({ result }));

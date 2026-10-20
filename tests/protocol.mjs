@@ -15,6 +15,7 @@ try {
   assert.equal(opener._meta.ui.resourceUri, 'ui://pencil/editor-v1.html');
     assert(opener.inputSchema.required.includes('path'));
   assert(!tools.some(x => x.name === 'pencil_attach_file'));
+  assert.equal(tools.find(x => x.name === 'pencil_save').annotations.destructiveHint, true);
   const ui = await client.readResource({ uri: 'ui://pencil/editor-v1.html' });
   assert(ui.contents[0].text.includes('Pencil editor'));
   assert.deepEqual(ui.contents[0]._meta.ui.csp.frameDomains, ['https://app.pen.dev']);

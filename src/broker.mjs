@@ -53,6 +53,7 @@ export async function startBroker({ token = randomUUID(), timeout, draftRoot, ed
       else if (method === 'call') result = await sessions.call(args.sessionId, args.lease, args.tool, args.arguments, { observational: args.readOnly === true });
       else if (method === 'capture') result = await sessions.capture(args.sessionId, args.lease, args.nodeIds, args.directory);
       else if (method === 'export') result = await sessions.exportNodes(args.sessionId, args.lease, args.nodeIds, args.format, args.directory);
+      else if (method === 'save') result = await sessions.save(args.sessionId, args.lease);
       else if (method === 'save-as') result = await sessions.saveAs(args.sessionId, args.lease, args.path);
       else throw new Error('Unknown broker method');
       res.end(JSON.stringify({ result }));

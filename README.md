@@ -1,5 +1,11 @@
 # Pencil
 
+<p align="center">
+  <img src="docs/images/login-light.png" alt="Light login screen for a fintech app, designed in Pencil by a Claude Code session" width="49%">
+  <img src="docs/images/login-dark.png" alt="Dark split-layout login screen for a music app, designed in Pencil by a second Claude Code session" width="49%">
+</p>
+<p align="center"><em>Two login screens designed at the same time by two Claude Code sessions, each in its own Pencil document, then saved and exported with this plugin.</em></p>
+
 A Claude Code plugin that opens `.pen` design documents in the real Pencil editor, without adding another chat interface. A local Node.js service keeps one channel per design session, so several agents can share a document and reserve it for short read/edit/verify sequences.
 
 This repository, **pencil-claude**, contains one independently installable Claude Code plugin. Its display name is **Pencil** and its identifier is `pencil`. The Codex version lives in the separate [pencil-codex](https://github.com/julien-m/pencil-codex) repository.
@@ -68,9 +74,10 @@ Documents open only through `pencil_open` or `pencil_new`. The plugin does not r
 | `pencil_call` | Call native tools: `execute`, `get_app_state`, `get_style`, `read_skill`. Pass `readOnly: true` for `execute` snippets that only read |
 | `pencil_capture` | PNG captures of node IDs, or `["document"]` for the whole design |
 | `pencil_export` | PNG, JPEG, WEBP, PDF, HTML/CSS or HTML/Tailwind export of the selected nodes |
+| `pencil_save` | Replace the original `.pen` file with the last acknowledged draft; refused if the file changed on disk since it was loaded |
 | `pencil_save_as` | Copy the last acknowledged draft to a new `.pen` file |
 
-Captures, exports and Save As need a reservation and an existing absolute destination directory, and never overwrite an existing file. Exporting HTML/CSS and HTML/Tailwind both write `index.html`, so use separate directories for them. Engine screenshots are small previews; use `pencil_export` for full-resolution images.
+Captures, exports, Save and Save As need a reservation. Captures, exports and Save As need an existing absolute destination and never overwrite an existing file; Save is the only tool that replaces a file, and only the session's own original. Exporting HTML/CSS and HTML/Tailwind both write `index.html`, so use separate directories for them. Engine screenshots are small previews; use `pencil_export` for full-resolution images.
 
 ### Agent activity
 
@@ -103,7 +110,8 @@ Source: [MCP server](src/server.mjs), [client/service bootstrap](src/client.mjs)
 
 - Private data lives in `${CLAUDE_PLUGIN_DATA}` (by default `~/.claude/plugins/data/pencil-pencil/`), which survives plugin updates and is removed when the plugin is uninstalled from its last scope unless you keep its data. If the variable is absent (development), `PENCIL_DATA` or the plugin's `.runtime/` directory is used.
 - `connection.json` holds the service port, its private token and PID (mode 0600).
-- Edits are saved to `drafts/<hash>.pen`, keyed by scope and file. **The original document is never replaced.** Reopening the same file with the same `scope` reloads the draft, including after a service restart.
+- The engine's autosaves go to `drafts/<hash>.pen`, keyed by scope and file. The original document changes only when an agent calls `pencil_save`. Reopening the same file with the same `scope` reloads the draft, including after a service restart.
+- `pencil_save` requires `saveState` `draft-saved`. It checks that the original still has the content the engine loaded (otherwise `SAVE_CONFLICT`, and nothing is replaced), copies the previous version to `backups/`, then atomically replaces the file, keeping its permissions. A final check runs just before the replacement; a write by another program in that last instant can still be lost, which is why the backup exists.
 - `pencil_save_as` copies the draft to a new file once `saveState` is `draft-saved`. Any `execute` call not marked `readOnly` sets `saveState` to `check-required` until the engine saves again; an edit that changes nothing does not trigger a save.
 - Assets are limited to `images/` and `fonts/` next to the document. Traversal paths, symbolic links and `.pen` files used as assets are rejected.
 
@@ -120,7 +128,8 @@ Verified on macOS with Claude Code 2.1.296, the plugin installed from a local ch
 
 - A Claude Code session loaded the installed plugin, opened a document with `pencil_open`, and reserved it; the badge showed its label.
 - Two independent agent processes (Codex CLI runs connected to this plugin's installed MCP server and data directory) shared one design session: agent A created a hero and kept the reservation; agent B's `pencil_begin` was refused with `LEASE_BUSY: Document reserved by Agent A`; after release, agent B read the document, preserved agent A's nodes, added a features section, captured the document and a component, and after a service restart reopened the same scope, saved a new file with `pencil_save_as` (a second Save As to the same path was refused) and exported a PDF. The original file was unchanged.
-- Captures of a component, a screen and the whole document; exports in all six formats; document creation; Save As; layers panel navigation.
+- Two Claude Code sessions, each with the installed plugin, created two documents and designed the two login screens shown above at the same time; each view showed its own agent badge, and each draft contained only its own design. `pencil_save` then wrote both designs into their original files and kept backups of the previous versions.
+- Captures of a component, a screen and the whole document; exports in all six formats; document creation; Save; Save As; layers panel navigation.
 
 Known limits:
 
@@ -128,7 +137,7 @@ Known limits:
 - The view must stay visible while agents work. An unanswered call times out after 15 s with `OUTCOME_UNKNOWN` and blocks the session. Never replay that mutation: reload the view, which reloads the last saved draft and unblocks the session (`recoveries` increases); then re-read before editing.
 - Asynchronous generation (`Generate(...)`) is not supported.
 - External `.pen` libraries and the editor's document-library requests (such as `documents-list`) are not implemented; open and create documents with the plugin tools.
-- No command overwrites the original document; use Save As.
+- Two views of different documents can be open at once. A view that was loaded while visible kept working from a background tab during the test; a view first loaded in a hidden pane did not start the engine.
 
 ## Stopping the service
 

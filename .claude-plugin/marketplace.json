@@ -10,7 +10,7 @@
     {
       "name": "pencil",
       "description": "Open .pen designs in the real Pencil editor through a local view, with one channel per design session and multi-agent reservations.",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "source": "./",
       "category": "design"
     }

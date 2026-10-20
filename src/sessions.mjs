@@ -143,6 +143,29 @@ export class Sessions {
     const saved = await writeNewFile(filename, await fs.readFile(s.draft));
     return { path: saved, sessionId: id, sourceUnchanged: true };
   }
+  // Replace the original with the acknowledged draft, only if nobody changed it since the engine loaded it.
+  // The previous version is kept in backups/ first; a final hash check runs right before the atomic rename.
+  async save(id, token) {
+    const s = this.get(id);
+    if (s.lease?.token !== token || s.pending.size || s.queued || s.blocked) fail('SAVE_NOT_READY', 'Reserve the session and wait for pending operations');
+    if (s.saveState !== 'draft-saved' && s.saveState !== 'host-saved') fail('SAVE_NOT_READY', 'Wait for an engine save acknowledgement before saving');
+    const unchanged = async () => s.savedHash !== null && digest(await fs.readFile(s.file)) === s.savedHash;
+    const conflict = () => { s.saveState = 'conflict'; fail('SAVE_CONFLICT', 'The original file changed since it was loaded; nothing was replaced. Use Save As'); };
+    if (!await unchanged()) conflict();
+    const bytes = await fs.readFile(s.draft), previous = await fs.readFile(s.file);
+    const backups = path.join(path.dirname(this.draftRoot), 'backups');
+    await fs.mkdir(backups, { recursive: true, mode: 0o700 });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const backupPath = await writeNewFile(path.join(backups, `${path.basename(s.file, '.pen')}-${stamp}-${randomUUID().slice(0, 8)}.pen`), previous);
+    const temp = path.join(path.dirname(s.file), `.${path.basename(s.file)}.${randomUUID()}.tmp`);
+    try {
+      await fs.writeFile(temp, bytes, { flag: 'wx', mode: (await fs.stat(s.file)).mode & 0o777 });
+      if (!await unchanged()) conflict();
+      await fs.rename(temp, s.file);
+    } finally { await fs.unlink(temp).catch(() => {}); }
+    s.savedHash = digest(bytes);
+    return { path: s.file, backupPath, sessionId: id, bytes: bytes.length };
+  }
   async storage(id, generation, method, payload) {
     const s = this.get(id);
     if (generation !== s.generation || !s.connected) fail('STALE_CHANNEL', 'Stale channel');
@@ -157,8 +180,7 @@ export class Sessions {
       if (typeof payload?.content !== 'string' || Buffer.byteLength(payload.content) > 32 * 1024 * 1024) fail('INVALID_CONTENT', 'Invalid content');
       if (payload.fileURI !== `file:///${s.virtualRoot}${encodeURIComponent(path.basename(s.file))}`) fail('WRONG_DOCUMENT', 'Unexpected document URI');
       if (method === 'storage-write' && (s.savedHash === null || digest(await fs.readFile(s.file)) !== s.savedHash)) { s.saveState = 'conflict'; return 2; }
-      // Direct-path previews never replace the user's source. Native file viewers
-      // save through the host's ETag-aware resource API in the UI instead.
+      // Engine autosaves only update the draft; the original changes through save().
       await fs.mkdir(this.draftRoot, { recursive: true, mode: 0o700 });
       await this.atomicWrite(s.draft, Buffer.from(payload.content));
       s.writeEpoch += 1; s.saveState = 'draft-saved'; return 0;

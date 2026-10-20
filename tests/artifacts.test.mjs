@@ -34,3 +34,34 @@ test('exclusive file write does not replace a pre-existing destination', async (
   await expect(writeNewFile(target, Buffer.from('replacement'))).rejects.toMatchObject({ code: 'EEXIST' });
   expect(await fs.readFile(target, 'utf8')).toBe('original');
 });
+test('Save replaces the original with the acknowledged draft and keeps a backup', async () => {
+  const original = path.join(directory, 'doc.pen'); await fs.writeFile(original, 'v1', { mode: 0o644 });
+  const sessions = new Sessions({ draftRoot: path.join(directory, 'data/drafts') });
+  const { sessionId } = await sessions.open(original, 's'); const { generation, fileURI } = sessions.attach(sessionId, () => {});
+  await sessions.storage(sessionId, generation, 'storage-load');
+  await sessions.storage(sessionId, generation, 'storage-write', { fileURI, content: 'v2' });
+  const { lease } = sessions.acquire(sessionId, 'agent');
+  const result = await sessions.save(sessionId, lease);
+  expect(await fs.readFile(original, 'utf8')).toBe('v2');
+  expect((await fs.stat(original)).mode & 0o777).toBe(0o644);
+  expect(await fs.readFile(result.backupPath, 'utf8')).toBe('v1');
+  expect(path.dirname(result.backupPath)).toBe(await fs.realpath(path.join(directory, 'data/backups')));
+  expect((await fs.readdir(directory)).filter(f => f.endsWith('.tmp'))).toEqual([]);
+  // The engine's next autosave is not treated as an external conflict.
+  expect(await sessions.storage(sessionId, generation, 'storage-write', { fileURI, content: 'v3' })).toBe(0);
+  expect((await sessions.save(sessionId, lease)).path).toBe(await fs.realpath(original));
+  expect(await fs.readFile(original, 'utf8')).toBe('v3');
+});
+test('Save refuses when the original changed on disk or without a reservation', async () => {
+  const original = path.join(directory, 'doc.pen'); await fs.writeFile(original, 'v1');
+  const sessions = new Sessions({ draftRoot: path.join(directory, 'data/drafts') });
+  const { sessionId } = await sessions.open(original, 's'); const { generation, fileURI } = sessions.attach(sessionId, () => {});
+  await sessions.storage(sessionId, generation, 'storage-load');
+  await sessions.storage(sessionId, generation, 'storage-save-draft', { fileURI, content: 'agent-edit' });
+  await expect(sessions.save(sessionId, 'no-lease')).rejects.toMatchObject({ code: 'SAVE_NOT_READY' });
+  const { lease } = sessions.acquire(sessionId, 'agent');
+  await fs.writeFile(original, 'human-edit');
+  await expect(sessions.save(sessionId, lease)).rejects.toMatchObject({ code: 'SAVE_CONFLICT' });
+  expect(await fs.readFile(original, 'utf8')).toBe('human-edit');
+  expect(sessions.status(sessionId).saveState).toBe('conflict');
+});

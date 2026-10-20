@@ -17,6 +17,6 @@ The `pencil` MCP server exposes `pencil_*` tools. Documents open only through th
 Rules:
 - `.pen` files are opaque: never read or write them with file tools.
 - Captures (`pencil_capture`), exports (`pencil_export`) and `pencil_save_as` need a lease and an existing absolute destination; they never overwrite.
-- Edits go to a draft in the plugin data directory; the original file is never replaced. Use `pencil_save_as` after `saveState` is `draft-saved`.
+- Edits go to a draft in the plugin data directory until saved. After `saveState` is `draft-saved`, use `pencil_save` to write the original file (refused with `SAVE_CONFLICT` if it changed on disk; then use `pencil_save_as`), or `pencil_save_as` for a new file. Save only when the user asked for it or the task implies keeping the result in that file.
 - After `OUTCOME_UNKNOWN`, never replay the mutation. Reload the view: the new view reloads the last saved draft and unblocks the session (`recoveries` increases). Re-read the document before any further edit.
 - `Generate(...)` (asynchronous generation) is unsupported.
