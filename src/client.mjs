@@ -13,8 +13,10 @@ export async function connectBroker(directory = dataDirectory()) {
     try {
       const info = JSON.parse(await fs.readFile(connection, 'utf8'));
       const response = await fetch(`http://127.0.0.1:${info.port}/rpc`, { method: 'POST', headers: { Authorization: `Bearer ${info.token}` }, body: JSON.stringify({ method: 'ping' }), signal: AbortSignal.timeout(1000) });
-      if (!response.ok || (await response.json()).result?.version !== VERSION) return null;
-      return info;
+      if (!response.ok) return null;
+      const advertised = (await response.json()).result;
+      if (advertised?.version !== VERSION || !Number.isSafeInteger(advertised.rpcTimeoutMs) || advertised.rpcTimeoutMs <= 0 || advertised.rpcTimeoutMs > 2147483647) return null;
+      return { ...info, editorWait: advertised.editorWait, rpcTimeoutMs: advertised.rpcTimeoutMs };
     } catch { return null; }
   };
   let info = await read();
@@ -35,7 +37,7 @@ export async function connectBroker(directory = dataDirectory()) {
     ...info,
     async rpc(method, args = {}) {
       let response;
-      try { response = await fetch(`http://127.0.0.1:${info.port}/rpc`, { method: 'POST', headers: { Authorization: `Bearer ${info.token}` }, body: JSON.stringify({ method, args }), signal: AbortSignal.timeout(22000) }); }
+      try { response = await fetch(`http://127.0.0.1:${info.port}/rpc`, { method: 'POST', headers: { Authorization: `Bearer ${info.token}` }, body: JSON.stringify({ method, args }), signal: AbortSignal.timeout(info.rpcTimeoutMs) }); }
       catch (e) { if (e.cause?.code === 'ECONNREFUSED') throw Object.assign(new Error('Local Pencil service stopped'), { code: 'BROKER_UNREACHABLE' }); throw e; }
       if (!response.ok) throw new Error(`Local service HTTP ${response.status}`);
       const data = await response.json();

@@ -14,7 +14,7 @@ test('real loopback transport authenticates and routes one editor without broadc
     const sessions = [];
     for (const name of ['a', 'b']) {
       const file = path.join(dir, `${name}.pen`); await fs.writeFile(file, name); const s = await rpc('open', { path: file, scope: name }); sessions.push(s);
-      const peer = new WebSocket(`ws://127.0.0.1:${b.port}/editor?session=${s.sessionId}&token=${s.editorToken}`); peers.push(peer);
+      const peer = new WebSocket(`ws://127.0.0.1:${b.port}/editor?session=${s.sessionId}&token=${s.editorToken}`); peers.push(peer); peer.once('open', () => peer.send(JSON.stringify({ kind: 'ready' })));
       await new Promise((resolve, reject) => { peer.once('message', resolve); peer.once('error', reject); });
       peer.on('message', bytes => { const m = JSON.parse(bytes); if (m.kind === 'request') peer.send(JSON.stringify({ kind: 'response', id: m.id, payload: { content: [{ type: 'text', text: name }] } })); });
     }
@@ -53,6 +53,7 @@ test('one editor receives two agents\' calls before answering either, and revers
     await assert.rejects(rpc('open', { path: file, scope: 'another-session' }), { code: 'DOCUMENT_BUSY' });
     const requests = [], activity = [];
     peer = new WebSocket(`ws://127.0.0.1:${b.port}/editor?session=${session.sessionId}&token=${session.editorToken}`);
+    peer.once('open', () => peer.send(JSON.stringify({ kind: 'ready' })));
     await new Promise((resolve, reject) => { peer.once('message', resolve); peer.once('error', reject); });
     peer.on('message', raw => {
       const m = JSON.parse(raw);
@@ -72,4 +73,16 @@ test('one editor receives two agents\' calls before answering either, and revers
     await Promise.all(agents.map(a => rpc('release', { sessionId: session.sessionId, lease: a.lease })));
     assert.deepEqual(b.sessions.status(session.sessionId).agents, []);
   } finally { peer?.terminate(); await b.close(); await fs.rm(dir, { recursive: true, force: true }); }
+});
+test('MCP clients use the deadline advertised by the service, not their own environment', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pencil-deadline-')); const b = await startBroker({ editorWait: 123 }); const previous = process.env.PENCIL_EDITOR_WAIT_MS;
+  try {
+    await fs.writeFile(path.join(dir, 'connection.json'), JSON.stringify({ port: b.port, token: b.token }));
+    process.env.PENCIL_EDITOR_WAIT_MS = '1';
+    const { connectBroker } = await import('../src/client.mjs');
+    const client = await connectBroker(dir);
+    assert.equal(client.editorWait, 123);
+    assert.equal(client.rpcTimeoutMs, b.sessions.rpcBudget);
+    assert(client.rpcTimeoutMs > client.editorWait + b.sessions.timeout);
+  } finally { if (previous === undefined) delete process.env.PENCIL_EDITOR_WAIT_MS; else process.env.PENCIL_EDITOR_WAIT_MS = previous; await b.close(); await fs.rm(dir, { recursive: true, force: true }); }
 });

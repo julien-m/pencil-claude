@@ -56,8 +56,8 @@ Ask Claude to use Pencil, for example: “Open /absolute/path/landing.pen in Pen
 
 1. The agent calls `pencil_open` with an absolute `.pen` path and an explicit `scope`, or `pencil_new` to create a document. It receives a `sessionId` and a `viewUrl`.
 2. The agent (or you) opens `viewUrl`. **Keep the view visible**: a page loaded or left in a hidden pane or background tab may never start the Pencil engine, and calls then time out.
-3. The agent waits until `pencil_status` reports `connected: true`, then loads the native instructions with `pencil_call` → `read_skill`.
-4. The agent joins with `pencil_begin`, works with `pencil_call`, and leaves with `pencil_end`.
+3. Agents can be launched right away, while the view opens: `pencil_begin` joins immediately, and engine calls wait for the engine (see *Startup* below). Each agent loads the native instructions with `pencil_call` → `read_skill`.
+4. The agent joins with `pencil_begin`, works with `pencil_call`, and leaves with `pencil_end`. New documents are empty: each agent creates its own frame in its first `execute`; the plugin never creates frames or decides how many screens there are.
 5. To collaborate, other agents receive the `sessionId` only and join with `pencil_begin`. They must not open the same file under another `scope` (that is refused with `DOCUMENT_BUSY`).
 
 ### Shared sessions
@@ -85,13 +85,20 @@ A snapshot only counts as containing an edit if it reaches the service **after**
 
 Documents open only through `pencil_open` or `pencil_new`. The plugin does not register any `.pen` file association.
 
+### Startup
+
+- **Joining never waits.** `pencil_begin` answers at once, even before any view is open.
+- **Engine calls wait for the engine.** A call sent before the view has loaded the hosted engine waits for the engine's handshake (not just an open socket) until a deadline, 20 s by default. The service reads `PENCIL_EDITOR_WAIT_MS` at startup and advertises its deadlines to every MCP client, so a client with a different environment cannot shorten them. At expiry the call returns `EDITOR_OFFLINE` and nothing was sent. While held back, calls are visible as `waitingCalls` in `pencil_status` and as "waiting for the engine" in the view; expired calls appear in `recentCalls`.
+- **Engine documentation is fetched once per session.** `read_skill` (per path) and the tool schemas are identical for every agent: concurrent requests share one engine round trip, each agent receives its own copy, errors are not kept, and a reconnected view (new engine generation) starts afresh. `pencil_status` reports `metadataStats` and logs hits as `cache-hit`.
+- `pencil_status` also reports `openedAt` and `readyAt`, and every call's `queuedAt`, `sentAt` and `settledAt`, so the time spent waiting for the engine, preparing in the agent, and executing can be told apart.
+
 ### Tools
 
 | Tool | Purpose |
 |---|---|
 | `pencil_open` | Open an existing `.pen` file in a design session; returns `sessionId` and `viewUrl` |
 | `pencil_new` | Create a `.pen` file at a new absolute path (never overwrites), then open it |
-| `pencil_status` | Connection, agents with their running calls, `saving`, save state, `unsavedMutations`, draft path, and `recentCalls` (agent, tool, request id, sent and answered timestamps) |
+| `pencil_status` | Connection, `editorReady`, agents with their running and waiting calls, `saving`, save state, `unsavedMutations`, `metadataStats`, draft path, `openedAt`/`readyAt` and `recentCalls` (agent, tool, request id, queued, sent and answered timestamps) |
 | `pencil_tools` | Native engine tool schemas |
 | `pencil_begin` / `pencil_end` | Join / leave the shared session; each agent gets its own non-exclusive participation token |
 | `pencil_call` | Call native tools: `execute`, `get_app_state`, `get_style`, `read_skill`. Pass `readOnly: true` for `execute` snippets that only read |
@@ -156,6 +163,9 @@ Verified on macOS with Claude Code 2.1.296, the plugin installed from a local ch
 - **Overlap, from the plugin's own `recentCalls`.** One edit per agent, each in its own mock-up, sent at the same time: both requests left the plugin at 06:50:56.380, before either answer; Agent A's answer arrived at 06:50:57.893 and Agent B's at 06:50:59.400. Inside the engine, the snippets ran one after the other (A 56.392–57.892, B 57.899–59.399). Between the two answers `unsavedMutations` was 2.
 - **Save on the real engine.** `pencil_save` used the engine flush (`engine-flush`, answer `1`), wrote both mock-ups and both simultaneous edits into the original file (200 → 12,361 bytes), kept a backup, and left `unsavedMutations` at 0. Both mock-ups were then captured and exported.
 - In normal agent work, individual calls last 10–100 ms while agents spend seconds between calls, so calls from two working agents rarely overlap in time even though nothing makes them wait.
+- **Startup (0.5.0), three sub-agents, real engine, empty document.**
+  - *View opened late on purpose (72 s after creation):* the three agents joined with no view; calls made within the 20 s deadline waited and then went out (one waited 19.2 s); older calls failed cleanly with `EDITOR_OFFLINE` and nothing was sent. The empty document opened in the hosted engine and each agent created its own frame.
+  - *View opened right away:* the engine was ready 8.3 s after creation, but the agents' first calls only left at +22 s, +27 s and +34 s: an agent's own start-up takes longer than the engine. No call had to wait and none failed. First successful edits came at +51 s, +53 s and +69 s, almost entirely agent preparation. Documentation requests to the engine: 3 instead of 8 (5 cache hits), which saves engine traffic but well under a second of time. `pencil_save` then flushed the engine (`engine-flush`), including an edit not yet autosaved, and the saved file held all three screens.
 - Captures of a component, a screen and the whole document; exports in all six formats; document creation; Save; Save As; layers panel navigation.
 
 Known limits:
@@ -165,6 +175,7 @@ Known limits:
 - The plugin forwards calls in parallel, but the hosted Pencil engine runs `execute` snippets one after another: two simultaneous calls overlap in the plugin and complete one after the other in the engine.
 - No automatic merge: two agents editing the same object get last-write-wins from the engine. Engine globals created by `execute` are shared between agents.
 - New calls are held back while a save flushes and writes (normally well under a second).
+- The startup changes reduce engine traffic and let agents start before the view; they do not shorten loading of the hosted engine or the agents' own preparation, which dominate the time to a first edit. If the view is opened by hand more than 20 s after agents start, their first calls fail with `EDITOR_OFFLINE`: raise `PENCIL_EDITOR_WAIT_MS` before the service starts, or open the view first.
 - Asynchronous generation (`Generate(...)`) is not supported.
 - External `.pen` libraries and the editor's document-library requests (such as `documents-list`) are not implemented; open and create documents with the plugin tools.
 - Two views of different documents can be open at once. A view that was loaded while visible kept working from a background tab during the test; a view first loaded in a hidden pane did not start the engine.

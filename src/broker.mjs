@@ -11,8 +11,8 @@ const same = (a, b) => {
   const left = Buffer.from(a), right = Buffer.from(b);
   return left.length === right.length && timingSafeEqual(left, right);
 };
-export async function startBroker({ token = randomUUID(), timeout, draftRoot, saveWait, editorHtml } = {}) {
-  const sessions = new Sessions({ timeout, draftRoot, saveWait, onActivity: id => broadcast(id) }), views = new Map();
+export async function startBroker({ token = randomUUID(), timeout, draftRoot, saveWait, editorWait, editorHtml } = {}) {
+  const sessions = new Sessions({ timeout, draftRoot, saveWait, editorWait, onActivity: id => broadcast(id) }), views = new Map();
   let port;
   const viewUrl = id => `http://127.0.0.1:${port}/view/${id}/${views.get(id)}`;
   // The local view replaces the MCP App panel in hosts that do not render MCP Apps (Claude Code).
@@ -40,13 +40,14 @@ export async function startBroker({ token = randomUUID(), timeout, draftRoot, sa
       for await (const chunk of req) { raw += chunk; if (raw.length > 40 * 1024 * 1024) throw new Error('Request too large'); }
       const { method, args = {} } = JSON.parse(raw);
       let result;
-      if (method === 'ping') result = { version: VERSION };
+      // The service owns the deadlines; clients use the budget it advertises, not their own environment.
+      if (method === 'ping') result = { version: VERSION, editorWait: sessions.editorWait, rpcTimeoutMs: sessions.rpcBudget };
       else if (method === 'open' || method === 'new') {
         const filename = method === 'new' ? await createDocument(args.path) : args.path;
         result = await sessions.open(filename, args.scope);
         if (!views.has(result.sessionId)) views.set(result.sessionId, randomUUID());
         result = { ...result, editorToken: views.get(result.sessionId), viewUrl: viewUrl(result.sessionId) };
-      } else if (method === 'schema') result = await sessions.request(args.sessionId, 'get-mcp-schema');
+      } else if (method === 'schema') result = await sessions.schema(args.sessionId);
       else if (method === 'status') result = sessions.status(args.sessionId);
       else if (method === 'acquire') result = sessions.acquire(args.sessionId, args.agent);
       else if (method === 'release') result = sessions.release(args.sessionId, args.lease);
@@ -70,7 +71,7 @@ export async function startBroker({ token = randomUUID(), timeout, draftRoot, sa
       let generation;
       peer.sessionId = id;
       try {
-        const config = sessions.attach(id, message => peer.send(JSON.stringify(message)));
+        const config = sessions.attach(id, message => peer.send(JSON.stringify(message)), { ready: false });
         generation = config.generation;
         peer.send(JSON.stringify({ kind: 'config', ...config }));
         peer.send(JSON.stringify({ kind: 'activity', status: sessions.status(id) }));
@@ -78,7 +79,8 @@ export async function startBroker({ token = randomUUID(), timeout, draftRoot, sa
       peer.on('message', bytes => {
         try {
           const message = JSON.parse(bytes.toString());
-          if (message.kind === 'response') sessions.reply(id, generation, message);
+          if (message.kind === 'ready') sessions.ready(id, generation);
+          else if (message.kind === 'response') sessions.reply(id, generation, message);
           else if (message.kind === 'storage') {
             // Registered synchronously, in channel order: the sessions layer persists them one by one.
             sessions.storage(id, generation, message.method, message.payload).then(

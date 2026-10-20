@@ -11,7 +11,7 @@ function connectEditor() {
   const channel = new MessageChannel(); port = channel.port1;
   port.onmessage = event => {
     const m = event.data;
-    if (m.kind === 'ready') { connected = true; clearInterval(timer); show('Channel connected · loading the engine'); window.pencilPanelState = 'bridge-ready'; return; }
+    if (m.kind === 'ready') { socket.send(JSON.stringify({ kind: 'ready' })); connected = true; clearInterval(timer); show('Channel connected · loading the engine'); window.pencilPanelState = 'bridge-ready'; return; }
     if (m.kind === 'error') { show(`Pencil: ${m.message}`); return; }
     if (m.kind === 'request') {
       const payload = m.payload;
@@ -30,7 +30,7 @@ function start(editor) {
     const m = JSON.parse(event.data);
     if (m.kind === 'activity') {
       const agents = m.status.agents ?? [];
-      const list = agents.map(a => `● ${a.agent} · ${a.activeCalls ? `${a.activeCalls} call${a.activeCalls > 1 ? 's' : ''} running` : 'idle'}`).join('   |   ');
+      const list = agents.map(a => `● ${a.agent} · ${a.activeCalls ? `${a.activeCalls} call${a.activeCalls > 1 ? 's' : ''} running` : a.waitingCalls ? 'waiting for the engine' : 'idle'}`).join('   |   ');
       document.querySelector('#activity').textContent = (agents.length ? `${agents.length} agent${agents.length > 1 ? 's' : ''}: ${list}` : 'No agent on this document') + (m.status.saving ? '   ·   saving…' : '');
       return;
     }

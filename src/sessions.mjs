@@ -3,6 +3,7 @@ import * as fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { writeNewFile, exportDirectory, writeExportFile } from './artifacts.mjs';
+import { DEFAULT_EDITOR_WAIT_MS } from './config.mjs';
 
 const digest = value => createHash('sha256').update(value).digest('hex');
 export class SessionError extends Error {
@@ -11,9 +12,11 @@ export class SessionError extends Error {
 const fail = (code, message) => { throw new SessionError(code, message); };
 
 export class Sessions {
-  constructor({ timeout = 15000, draftRoot = path.join(os.tmpdir(), 'pencil-drafts'), saveWait = 5000, onActivity = () => {} } = {}) {
-    this.items = new Map(); this.timeout = timeout; this.draftRoot = draftRoot; this.saveWait = saveWait; this.onActivity = onActivity;
+  constructor({ timeout = 15000, draftRoot = path.join(os.tmpdir(), 'pencil-drafts'), saveWait = 5000, editorWait = DEFAULT_EDITOR_WAIT_MS, onActivity = () => {} } = {}) {
+    this.items = new Map(); this.timeout = timeout; this.draftRoot = draftRoot; this.saveWait = saveWait; this.editorWait = editorWait; this.onActivity = onActivity;
   }
+  // Longest an RPC can legitimately take: editor wait, a call or flush, the calls a save waits for, and the autosave wait.
+  get rpcBudget() { return this.editorWait + 2 * this.timeout + this.saveWait + 2000; }
   get(id) { return this.items.get(id) ?? fail('SESSION_NOT_FOUND', 'Unknown session'); }
   // Exclusivity is between design sessions: a document belongs to exactly one session.
   async open(filename, scope) {
@@ -32,6 +35,7 @@ export class Sessions {
     const s = {
       id, scope, file, draft, exportJobs: new Map(), virtualRoot: `pencil/${id}/`, generation: 0, pending: new Map(),
       participants: new Map(), flights: new Set(), saving: null, persistTail: Promise.resolve(), coverageWaiters: new Set(), recent: [],
+      openedAt: Date.now(), readyAt: null, editorReady: false, readyWaiters: new Set(), metadata: new Map(), metadataStats: { requests: 0, hits: 0 },
       // mutations counts completed mutating calls; savedThrough is the highest count a persisted snapshot is known to contain.
       mutations: 0, savedThrough: 0,
       blocked: false, connected: false, savedHash: null, operations: 0, recoveries: 0, saveState: 'not-loaded'
@@ -41,29 +45,83 @@ export class Sessions {
   }
   status(id) {
     const s = this.get(id);
-    const agents = [...s.participants.values()].map(({ agent, activeCalls }) => ({ agent, activeCalls }));
+    const agents = [...s.participants.values()].map(({ agent, activeCalls, waitingCalls }) => ({ agent, activeCalls, waitingCalls }));
     return {
-      sessionId: s.id, scope: s.scope, name: path.basename(s.file), connected: s.connected, generation: s.generation, blocked: s.blocked,
+      sessionId: s.id, scope: s.scope, name: path.basename(s.file), connected: s.connected, editorReady: s.editorReady, openedAt: s.openedAt, readyAt: s.readyAt,
+      metadataStats: { ...s.metadataStats }, generation: s.generation, blocked: s.blocked,
       agents, activeCalls: s.flights.size, saving: !!s.saving, operations: s.operations, recoveries: s.recoveries,
       saveState: s.saveState, unsavedMutations: Math.max(0, s.mutations - s.savedThrough), draftPath: s.draft, recentCalls: s.recent.slice(-20)
     };
   }
-  attach(id, send) {
+  // ready: false when the engine must still confirm it is loaded (the real view sends "ready").
+  attach(id, send, { ready = true } = {}) {
     const s = this.get(id);
     if (s.connected) fail('EDITOR_ALREADY_CONNECTED', 'An editor view is already attached to this session');
     // A new view reloads the last acknowledged draft, which settles any unknown outcome:
     // unsaved engine state died with the previous view. Agents must re-read before editing.
     if (s.blocked) { s.blocked = false; s.recoveries += 1; }
-    s.generation += 1; s.send = send; s.connected = true;
+    s.generation += 1; s.send = send; s.connected = true; s.editorReady = false; s.readyAt = null;
+    s.metadata.clear(); s.metadataStats = { requests: 0, hits: 0 };
+    if (ready) this.ready(id, s.generation);
     return { generation: s.generation, fileURI: `file:///${s.virtualRoot}${encodeURIComponent(path.basename(s.file))}` };
+  }
+  ready(id, generation) {
+    const s = this.get(id);
+    if (!s.connected || generation !== s.generation) return false;
+    s.editorReady = true; s.readyAt = Date.now();
+    for (const wake of [...s.readyWaiters]) wake();
+    this.onActivity(id);
+    return true;
   }
   detach(id, generation) {
     const s = this.get(id);
     if (generation !== s.generation) return;
-    s.connected = false; s.send = undefined;
+    s.connected = false; s.editorReady = false; s.send = undefined; s.metadata.clear();
     for (const p of s.pending.values()) p.reject(new SessionError('OUTCOME_UNKNOWN', 'Connection lost during a call'));
     if (s.pending.size) s.blocked = true;
     s.pending.clear();
+    for (const wake of [...s.readyWaiters]) wake();
+  }
+  // Engine calls sent before the view is ready wait for its handshake until an absolute deadline;
+  // at expiry nothing has been sent, so nothing can be replayed.
+  waitForEditor(s, deadline) {
+    if (s.blocked) fail('OUTCOME_UNKNOWN', 'Session blocked; do not replay mutations');
+    if (s.connected && s.editorReady) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const wake = () => {
+        if (s.blocked) { done(); reject(new SessionError('OUTCOME_UNKNOWN', 'Session blocked; do not replay mutations')); }
+        else if (s.connected && s.editorReady) { done(); resolve(); }
+      };
+      const done = () => { clearTimeout(timer); s.readyWaiters.delete(wake); };
+      const timer = setTimeout(() => { done(); reject(new SessionError('EDITOR_OFFLINE', `The editor view was not ready within ${this.editorWait} ms; nothing was sent`)); }, Math.max(0, deadline - Date.now()));
+      s.readyWaiters.add(wake);
+    });
+  }
+  // Hold an engine call until no save is running and the engine is ready.
+  async dispatchable(s, deadline) {
+    for (;;) {
+      while (s.saving) await s.saving;
+      if (s.blocked) fail('OUTCOME_UNKNOWN', 'Session blocked; do not replay mutations');
+      if (s.connected && s.editorReady) return;
+      await this.waitForEditor(s, deadline);
+    }
+  }
+  // Engine documentation and tool schemas are identical for every agent of an engine generation:
+  // concurrent requests share one round trip and each caller gets its own copy. Errors are not kept.
+  async cached(s, key, produce) {
+    const generation = s.generation;
+    let entry = s.metadata.get(key), hit = !!entry;
+    if (!entry) {
+      s.metadataStats.requests += 1;
+      entry = Promise.resolve().then(produce).then(result => { if (result?.isError) s.metadata.delete(key); return result; }, error => { s.metadata.delete(key); throw error; });
+      if (generation === s.generation) s.metadata.set(key, entry);
+    } else s.metadataStats.hits += 1;
+    return { hit, value: structuredClone(await entry) };
+  }
+  async schema(id) {
+    const s = this.get(id);
+    await this.dispatchable(s, Date.now() + this.editorWait);
+    return (await this.cached(s, 'schema', () => this.request(id, 'get-mcp-schema'))).value;
   }
   // Inside a session every agent gets its own non-exclusive participation token (the "lease"
   // field): there is no lock between agents, and one agent leaving never interrupts the others.
@@ -71,13 +129,13 @@ export class Sessions {
     const s = this.get(id);
     if (s.blocked) fail('OUTCOME_UNKNOWN', 'Session blocked after an unknown outcome');
     const lease = randomUUID();
-    s.participants.set(lease, { agent, activeCalls: 0 });
+    s.participants.set(lease, { agent, activeCalls: 0, waitingCalls: 0 });
     this.onActivity(id);
     return { lease, ...this.status(id) };
   }
   release(id, token) {
     const s = this.get(id), participant = this.participant(s, token);
-    if (participant.activeCalls) fail('CALLS_IN_FLIGHT', 'This agent still has calls in progress');
+    if (participant.activeCalls || participant.waitingCalls) fail('CALLS_IN_FLIGHT', 'This agent still has calls in progress');
     s.participants.delete(token);
     this.onActivity(id);
     return this.status(id);
@@ -92,15 +150,38 @@ export class Sessions {
     if (!['execute', 'read_skill', 'get_style', 'get_app_state'].includes(name)) fail('TOOL_NOT_ALLOWED', 'Tool not exposed by this plugin');
     // Generation and execution are mixed in execute; async generation is excluded from this version.
     if (name === 'execute' && /\bGenerate\s*\(/.test(args.input ?? '')) fail('ASYNC_UNSUPPORTED', 'Asynchronous generation is not supported in this version');
-    while (s.saving) await s.saving;
+    const queuedAt = new Date().toISOString();
+    const waiting = this.participant(s, token);
+    if (s.saving || !(s.connected && s.editorReady)) {
+      // Visible while held back (engine loading or save running); an expiry is logged too.
+      waiting.waitingCalls += 1; this.onActivity(id);
+      try { await this.dispatchable(s, Date.now() + this.editorWait); }
+      catch (error) { this.log(s, { requestId: null, agent: waiting.agent, tool: name, mutating: false, queuedAt, sentAt: null, settledAt: new Date().toISOString(), outcome: error.code ?? 'error' }); throw error; }
+      finally { waiting.waitingCalls -= 1; this.onActivity(id); }
+    }
     const participant = this.participant(s, token);
-    if (s.blocked) fail('OUTCOME_UNKNOWN', 'Session blocked; do not replay mutations');
     const mutating = name === 'execute' && !observational;
-    const entry = { requestId: randomUUID(), agent: participant.agent, tool: name, mutating, sentAt: new Date().toISOString(), settledAt: null, outcome: 'pending' };
+    if (name === 'read_skill') {
+      const key = `read_skill:${args.path ?? ''}`, produce = () => this.send(s, participant, { name, args, mutating: false, queuedAt });
+      // A miss is logged and counted by send(); a hit (possibly waiting on another agent's request) is logged here.
+      if (!s.metadata.has(key)) return (await this.cached(s, key, produce)).value;
+      const entry = { requestId: null, agent: participant.agent, tool: name, mutating: false, queuedAt, sentAt: null, settledAt: null, outcome: 'cache-hit' };
+      this.log(s, entry);
+      participant.activeCalls += 1; this.onActivity(id);
+      try { return (await this.cached(s, key, produce)).value; }
+      catch (error) { entry.outcome = error.code ?? 'error'; throw error; }
+      finally { entry.settledAt = new Date().toISOString(); participant.activeCalls -= 1; this.onActivity(id); }
+    }
+    return this.send(s, participant, { name, args, mutating, queuedAt });
+  }
+  log(s, entry) { s.recent.push(entry); if (s.recent.length > 100) s.recent.shift(); }
+  async send(s, participant, { name, args, mutating, queuedAt }) {
+    const id = s.id;
+    const entry = { requestId: randomUUID(), agent: participant.agent, tool: name, mutating, queuedAt, sentAt: new Date().toISOString(), settledAt: null, outcome: 'pending' };
     const flight = this.request(id, 'mcp-tool-call', { name, arguments: args }, entry.requestId);
     const settled = flight.then(() => {}, () => {});
     s.flights.add(settled); participant.activeCalls += 1;
-    s.recent.push(entry); if (s.recent.length > 100) s.recent.shift();
+    this.log(s, entry);
     this.onActivity(id);
     try {
       const response = await flight;
@@ -174,6 +255,7 @@ export class Sessions {
     try {
       await Promise.all([...s.flights]);
       if (s.blocked) fail('OUTCOME_UNKNOWN', 'An operation has an unknown outcome; reload the view before saving');
+      await this.waitForEditor(s, Date.now() + this.editorWait);
       const flush = await this.flush(s);
       await s.persistTail;
       if (s.savedThrough < s.mutations) fail('SAVE_NOT_READY', `The engine did not persist ${s.mutations - s.savedThrough} completed change(s); nothing was written`);

@@ -36601,7 +36601,7 @@ import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 
 // src/version.mjs
-var VERSION = "0.4.0";
+var VERSION = "0.5.0";
 
 // src/client.mjs
 var root = fileURLToPath(new URL("../", import.meta.url));
@@ -36613,8 +36613,10 @@ async function connectBroker(directory = dataDirectory()) {
     try {
       const info2 = JSON.parse(await fs.readFile(connection, "utf8"));
       const response = await fetch(`http://127.0.0.1:${info2.port}/rpc`, { method: "POST", headers: { Authorization: `Bearer ${info2.token}` }, body: JSON.stringify({ method: "ping" }), signal: AbortSignal.timeout(1e3) });
-      if (!response.ok || (await response.json()).result?.version !== VERSION) return null;
-      return info2;
+      if (!response.ok) return null;
+      const advertised = (await response.json()).result;
+      if (advertised?.version !== VERSION || !Number.isSafeInteger(advertised.rpcTimeoutMs) || advertised.rpcTimeoutMs <= 0 || advertised.rpcTimeoutMs > 2147483647) return null;
+      return { ...info2, editorWait: advertised.editorWait, rpcTimeoutMs: advertised.rpcTimeoutMs };
     } catch {
       return null;
     }
@@ -36650,7 +36652,7 @@ async function connectBroker(directory = dataDirectory()) {
     async rpc(method, args = {}) {
       let response;
       try {
-        response = await fetch(`http://127.0.0.1:${info.port}/rpc`, { method: "POST", headers: { Authorization: `Bearer ${info.token}` }, body: JSON.stringify({ method, args }), signal: AbortSignal.timeout(22e3) });
+        response = await fetch(`http://127.0.0.1:${info.port}/rpc`, { method: "POST", headers: { Authorization: `Bearer ${info.token}` }, body: JSON.stringify({ method, args }), signal: AbortSignal.timeout(info.rpcTimeoutMs) });
       } catch (e) {
         if (e.cause?.code === "ECONNREFUSED") throw Object.assign(new Error("Local Pencil service stopped"), { code: "BROKER_UNREACHABLE" });
         throw e;

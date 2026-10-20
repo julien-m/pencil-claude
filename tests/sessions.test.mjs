@@ -28,8 +28,8 @@ describe('collaboration inside a session', () => {
     const { sessionId: id } = await r.open(path.join(dir, 'a.pen'), 's');
     const a = r.acquire(id, 'A'), b = r.acquire(id, 'B');
     expect(a.lease).not.toBe(b.lease);
-    expect(r.status(id).agents).toEqual([{ agent: 'A', activeCalls: 0 }, { agent: 'B', activeCalls: 0 }]);
-    expect(r.release(id, a.lease).agents).toEqual([{ agent: 'B', activeCalls: 0 }]);
+    expect(r.status(id).agents).toEqual([{ agent: 'A', activeCalls: 0, waitingCalls: 0 }, { agent: 'B', activeCalls: 0, waitingCalls: 0 }]);
+    expect(r.release(id, a.lease).agents).toEqual([{ agent: 'B', activeCalls: 0, waitingCalls: 0 }]);
     await expect(r.call(id, a.lease, 'get_app_state')).rejects.toMatchObject({ code: 'INVALID_LEASE' });
     expect(events.length).toBe(3);
   });
@@ -40,7 +40,7 @@ describe('collaboration inside a session', () => {
     await tick();
     const [ra, rb] = engine.calls();
     expect(engine.calls()).toHaveLength(2); expect(ra.id).not.toBe(rb.id);
-    expect(r.status(id)).toMatchObject({ activeCalls: 2, agents: [{ agent: 'A', activeCalls: 1 }, { agent: 'B', activeCalls: 1 }] });
+    expect(r.status(id)).toMatchObject({ activeCalls: 2, agents: [{ agent: 'A', activeCalls: 1, waitingCalls: 0 }, { agent: 'B', activeCalls: 1, waitingCalls: 0 }] });
     expect(() => r.release(id, a.lease)).toThrow('in progress');
     engine.answer(rb, { content: [{ type: 'text', text: 'for B' }] });
     expect((await second).content[0].text).toBe('for B');
@@ -137,7 +137,7 @@ describe('unknown outcomes', () => {
     r.detach(id, first.generation);
     const second = r.attach(id, () => {});
     expect(second.generation).toBe(first.generation + 1);
-    expect(r.status(id)).toMatchObject({ blocked: false, recoveries: 1, agents: [{ agent: 'A', activeCalls: 0 }] });
+    expect(r.status(id)).toMatchObject({ blocked: false, recoveries: 1, agents: [{ agent: 'A', activeCalls: 0, waitingCalls: 0 }] });
     expect((await r.storage(id, second.generation, 'storage-load')).content).toBe('opaque-original');
     expect(r.release(id, lease).agents).toEqual([]);
   });

@@ -1,6 +1,5 @@
 import * as fs from 'node:fs/promises';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
 
 export async function writeNewFile(filename, bytes) {
   if (!path.isAbsolute(filename)) throw new Error('Choose an absolute path');
@@ -15,7 +14,8 @@ export async function writeNewFile(filename, bytes) {
 
 export async function createDocument(filename) {
   if (path.extname(filename).toLowerCase() !== '.pen') throw new Error('The new document must use the .pen extension');
-  const content = JSON.stringify({ version: '2.6', children: [{ type: 'frame', id: randomUUID(), name: 'Screen', width: 1440, height: 900, layout: 'vertical', gap: 16, alignItems: 'start', fill: '#FFFFFF' }] });
+  // New documents start empty: frames come from the task, never from the plugin.
+  const content = JSON.stringify({ version: '2.6', children: [] });
   return writeNewFile(filename, Buffer.from(content));
 }
 

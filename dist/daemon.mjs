@@ -3733,10 +3733,10 @@ var import_websocket = __toESM(require_websocket(), 1);
 var import_websocket_server = __toESM(require_websocket_server(), 1);
 
 // src/broker.mjs
-import { randomUUID as randomUUID3, randomBytes, timingSafeEqual } from "node:crypto";
+import { randomUUID as randomUUID2, randomBytes, timingSafeEqual } from "node:crypto";
 
 // src/sessions.mjs
-import { randomUUID as randomUUID2, createHash } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import * as fs2 from "node:fs/promises";
 import path2 from "node:path";
 import os from "node:os";
@@ -3744,7 +3744,6 @@ import os from "node:os";
 // src/artifacts.mjs
 import * as fs from "node:fs/promises";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
 async function writeNewFile(filename, bytes) {
   if (!path.isAbsolute(filename)) throw new Error("Choose an absolute path");
   const parent = await fs.realpath(path.dirname(filename));
@@ -3764,7 +3763,7 @@ async function writeNewFile(filename, bytes) {
 }
 async function createDocument(filename) {
   if (path.extname(filename).toLowerCase() !== ".pen") throw new Error("The new document must use the .pen extension");
-  const content = JSON.stringify({ version: "2.6", children: [{ type: "frame", id: randomUUID(), name: "Screen", width: 1440, height: 900, layout: "vertical", gap: 16, alignItems: "start", fill: "#FFFFFF" }] });
+  const content = JSON.stringify({ version: "2.6", children: [] });
   return writeNewFile(filename, Buffer.from(content));
 }
 async function exportDirectory(directory2) {
@@ -3791,6 +3790,14 @@ async function writeExportFile(directory2, relative, bytes) {
   return writeNewFile(path.join(parent, parts.at(-1)), bytes);
 }
 
+// src/config.mjs
+var DEFAULT_EDITOR_WAIT_MS = 2e4;
+function editorWaitFromEnv(value = process.env.PENCIL_EDITOR_WAIT_MS) {
+  const wait = Number(value ?? DEFAULT_EDITOR_WAIT_MS);
+  if (!Number.isFinite(wait) || wait < 0 || wait > 6e5) throw new Error("PENCIL_EDITOR_WAIT_MS must be between 0 and 600000");
+  return wait;
+}
+
 // src/sessions.mjs
 var digest = (value) => createHash("sha256").update(value).digest("hex");
 var SessionError = class extends Error {
@@ -3803,13 +3810,18 @@ var fail = (code, message) => {
   throw new SessionError(code, message);
 };
 var Sessions = class {
-  constructor({ timeout = 15e3, draftRoot = path2.join(os.tmpdir(), "pencil-drafts"), saveWait = 5e3, onActivity = () => {
+  constructor({ timeout = 15e3, draftRoot = path2.join(os.tmpdir(), "pencil-drafts"), saveWait = 5e3, editorWait = DEFAULT_EDITOR_WAIT_MS, onActivity = () => {
   } } = {}) {
     this.items = /* @__PURE__ */ new Map();
     this.timeout = timeout;
     this.draftRoot = draftRoot;
     this.saveWait = saveWait;
+    this.editorWait = editorWait;
     this.onActivity = onActivity;
+  }
+  // Longest an RPC can legitimately take: editor wait, a call or flush, the calls a save waits for, and the autosave wait.
+  get rpcBudget() {
+    return this.editorWait + 2 * this.timeout + this.saveWait + 2e3;
   }
   get(id) {
     return this.items.get(id) ?? fail("SESSION_NOT_FOUND", "Unknown session");
@@ -3826,7 +3838,7 @@ var Sessions = class {
       if (previous.scope !== scope) fail("DOCUMENT_BUSY", "This document already belongs to another design session; create a copy for a variant");
       return this.status(previous.id);
     }
-    const id = randomUUID2();
+    const id = randomUUID();
     const draft = path2.join(this.draftRoot, `${digest(`${scope}:${file}`)}.pen`);
     const s = {
       id,
@@ -3843,6 +3855,12 @@ var Sessions = class {
       persistTail: Promise.resolve(),
       coverageWaiters: /* @__PURE__ */ new Set(),
       recent: [],
+      openedAt: Date.now(),
+      readyAt: null,
+      editorReady: false,
+      readyWaiters: /* @__PURE__ */ new Set(),
+      metadata: /* @__PURE__ */ new Map(),
+      metadataStats: { requests: 0, hits: 0 },
       // mutations counts completed mutating calls; savedThrough is the highest count a persisted snapshot is known to contain.
       mutations: 0,
       savedThrough: 0,
@@ -3858,12 +3876,16 @@ var Sessions = class {
   }
   status(id) {
     const s = this.get(id);
-    const agents = [...s.participants.values()].map(({ agent, activeCalls }) => ({ agent, activeCalls }));
+    const agents = [...s.participants.values()].map(({ agent, activeCalls, waitingCalls }) => ({ agent, activeCalls, waitingCalls }));
     return {
       sessionId: s.id,
       scope: s.scope,
       name: path2.basename(s.file),
       connected: s.connected,
+      editorReady: s.editorReady,
+      openedAt: s.openedAt,
+      readyAt: s.readyAt,
+      metadataStats: { ...s.metadataStats },
       generation: s.generation,
       blocked: s.blocked,
       agents,
@@ -3877,7 +3899,8 @@ var Sessions = class {
       recentCalls: s.recent.slice(-20)
     };
   }
-  attach(id, send) {
+  // ready: false when the engine must still confirm it is loaded (the real view sends "ready").
+  attach(id, send, { ready = true } = {}) {
     const s = this.get(id);
     if (s.connected) fail("EDITOR_ALREADY_CONNECTED", "An editor view is already attached to this session");
     if (s.blocked) {
@@ -3887,30 +3910,105 @@ var Sessions = class {
     s.generation += 1;
     s.send = send;
     s.connected = true;
+    s.editorReady = false;
+    s.readyAt = null;
+    s.metadata.clear();
+    s.metadataStats = { requests: 0, hits: 0 };
+    if (ready) this.ready(id, s.generation);
     return { generation: s.generation, fileURI: `file:///${s.virtualRoot}${encodeURIComponent(path2.basename(s.file))}` };
+  }
+  ready(id, generation) {
+    const s = this.get(id);
+    if (!s.connected || generation !== s.generation) return false;
+    s.editorReady = true;
+    s.readyAt = Date.now();
+    for (const wake of [...s.readyWaiters]) wake();
+    this.onActivity(id);
+    return true;
   }
   detach(id, generation) {
     const s = this.get(id);
     if (generation !== s.generation) return;
     s.connected = false;
+    s.editorReady = false;
     s.send = void 0;
+    s.metadata.clear();
     for (const p of s.pending.values()) p.reject(new SessionError("OUTCOME_UNKNOWN", "Connection lost during a call"));
     if (s.pending.size) s.blocked = true;
     s.pending.clear();
+    for (const wake of [...s.readyWaiters]) wake();
+  }
+  // Engine calls sent before the view is ready wait for its handshake until an absolute deadline;
+  // at expiry nothing has been sent, so nothing can be replayed.
+  waitForEditor(s, deadline) {
+    if (s.blocked) fail("OUTCOME_UNKNOWN", "Session blocked; do not replay mutations");
+    if (s.connected && s.editorReady) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const wake = () => {
+        if (s.blocked) {
+          done();
+          reject(new SessionError("OUTCOME_UNKNOWN", "Session blocked; do not replay mutations"));
+        } else if (s.connected && s.editorReady) {
+          done();
+          resolve();
+        }
+      };
+      const done = () => {
+        clearTimeout(timer);
+        s.readyWaiters.delete(wake);
+      };
+      const timer = setTimeout(() => {
+        done();
+        reject(new SessionError("EDITOR_OFFLINE", `The editor view was not ready within ${this.editorWait} ms; nothing was sent`));
+      }, Math.max(0, deadline - Date.now()));
+      s.readyWaiters.add(wake);
+    });
+  }
+  // Hold an engine call until no save is running and the engine is ready.
+  async dispatchable(s, deadline) {
+    for (; ; ) {
+      while (s.saving) await s.saving;
+      if (s.blocked) fail("OUTCOME_UNKNOWN", "Session blocked; do not replay mutations");
+      if (s.connected && s.editorReady) return;
+      await this.waitForEditor(s, deadline);
+    }
+  }
+  // Engine documentation and tool schemas are identical for every agent of an engine generation:
+  // concurrent requests share one round trip and each caller gets its own copy. Errors are not kept.
+  async cached(s, key, produce) {
+    const generation = s.generation;
+    let entry = s.metadata.get(key), hit = !!entry;
+    if (!entry) {
+      s.metadataStats.requests += 1;
+      entry = Promise.resolve().then(produce).then((result) => {
+        if (result?.isError) s.metadata.delete(key);
+        return result;
+      }, (error) => {
+        s.metadata.delete(key);
+        throw error;
+      });
+      if (generation === s.generation) s.metadata.set(key, entry);
+    } else s.metadataStats.hits += 1;
+    return { hit, value: structuredClone(await entry) };
+  }
+  async schema(id) {
+    const s = this.get(id);
+    await this.dispatchable(s, Date.now() + this.editorWait);
+    return (await this.cached(s, "schema", () => this.request(id, "get-mcp-schema"))).value;
   }
   // Inside a session every agent gets its own non-exclusive participation token (the "lease"
   // field): there is no lock between agents, and one agent leaving never interrupts the others.
   acquire(id, agent) {
     const s = this.get(id);
     if (s.blocked) fail("OUTCOME_UNKNOWN", "Session blocked after an unknown outcome");
-    const lease = randomUUID2();
-    s.participants.set(lease, { agent, activeCalls: 0 });
+    const lease = randomUUID();
+    s.participants.set(lease, { agent, activeCalls: 0, waitingCalls: 0 });
     this.onActivity(id);
     return { lease, ...this.status(id) };
   }
   release(id, token) {
     const s = this.get(id), participant = this.participant(s, token);
-    if (participant.activeCalls) fail("CALLS_IN_FLIGHT", "This agent still has calls in progress");
+    if (participant.activeCalls || participant.waitingCalls) fail("CALLS_IN_FLIGHT", "This agent still has calls in progress");
     s.participants.delete(token);
     this.onActivity(id);
     return this.status(id);
@@ -3926,19 +4024,57 @@ var Sessions = class {
     this.participant(s, token);
     if (!["execute", "read_skill", "get_style", "get_app_state"].includes(name)) fail("TOOL_NOT_ALLOWED", "Tool not exposed by this plugin");
     if (name === "execute" && /\bGenerate\s*\(/.test(args.input ?? "")) fail("ASYNC_UNSUPPORTED", "Asynchronous generation is not supported in this version");
-    while (s.saving) await s.saving;
+    const queuedAt = (/* @__PURE__ */ new Date()).toISOString();
+    const waiting = this.participant(s, token);
+    if (s.saving || !(s.connected && s.editorReady)) {
+      waiting.waitingCalls += 1;
+      this.onActivity(id);
+      try {
+        await this.dispatchable(s, Date.now() + this.editorWait);
+      } catch (error) {
+        this.log(s, { requestId: null, agent: waiting.agent, tool: name, mutating: false, queuedAt, sentAt: null, settledAt: (/* @__PURE__ */ new Date()).toISOString(), outcome: error.code ?? "error" });
+        throw error;
+      } finally {
+        waiting.waitingCalls -= 1;
+        this.onActivity(id);
+      }
+    }
     const participant = this.participant(s, token);
-    if (s.blocked) fail("OUTCOME_UNKNOWN", "Session blocked; do not replay mutations");
     const mutating = name === "execute" && !observational;
-    const entry = { requestId: randomUUID2(), agent: participant.agent, tool: name, mutating, sentAt: (/* @__PURE__ */ new Date()).toISOString(), settledAt: null, outcome: "pending" };
+    if (name === "read_skill") {
+      const key = `read_skill:${args.path ?? ""}`, produce = () => this.send(s, participant, { name, args, mutating: false, queuedAt });
+      if (!s.metadata.has(key)) return (await this.cached(s, key, produce)).value;
+      const entry = { requestId: null, agent: participant.agent, tool: name, mutating: false, queuedAt, sentAt: null, settledAt: null, outcome: "cache-hit" };
+      this.log(s, entry);
+      participant.activeCalls += 1;
+      this.onActivity(id);
+      try {
+        return (await this.cached(s, key, produce)).value;
+      } catch (error) {
+        entry.outcome = error.code ?? "error";
+        throw error;
+      } finally {
+        entry.settledAt = (/* @__PURE__ */ new Date()).toISOString();
+        participant.activeCalls -= 1;
+        this.onActivity(id);
+      }
+    }
+    return this.send(s, participant, { name, args, mutating, queuedAt });
+  }
+  log(s, entry) {
+    s.recent.push(entry);
+    if (s.recent.length > 100) s.recent.shift();
+  }
+  async send(s, participant, { name, args, mutating, queuedAt }) {
+    const id = s.id;
+    const entry = { requestId: randomUUID(), agent: participant.agent, tool: name, mutating, queuedAt, sentAt: (/* @__PURE__ */ new Date()).toISOString(), settledAt: null, outcome: "pending" };
     const flight = this.request(id, "mcp-tool-call", { name, arguments: args }, entry.requestId);
     const settled = flight.then(() => {
     }, () => {
     });
     s.flights.add(settled);
     participant.activeCalls += 1;
-    s.recent.push(entry);
-    if (s.recent.length > 100) s.recent.shift();
+    this.log(s, entry);
     this.onActivity(id);
     try {
       const response = await flight;
@@ -3963,7 +4099,7 @@ var Sessions = class {
     if (s.saveState === "not-loaded" || s.saveState === "conflict") return;
     s.saveState = s.savedThrough >= s.mutations ? "draft-saved" : "check-required";
   }
-  request(id, method, payload, requestId = randomUUID2()) {
+  request(id, method, payload, requestId = randomUUID()) {
     const s = this.get(id);
     if (!s.connected) fail("EDITOR_OFFLINE", "Open the editor view for this session and wait for the engine");
     return new Promise((resolve, reject) => {
@@ -4008,14 +4144,14 @@ var Sessions = class {
       if (image.mimeType !== "image/png") fail("UNSUPPORTED_CAPTURE", "Unsupported capture format");
       const bytes = Buffer.from(image.data, "base64");
       if (bytes.length > 32 * 1024 * 1024 || !bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) fail("INVALID_CAPTURE", "Invalid PNG capture");
-      files.push(await writeNewFile(path2.join(target, `pencil-${randomUUID2()}.png`), bytes));
+      files.push(await writeNewFile(path2.join(target, `pencil-${randomUUID()}.png`), bytes));
     }
     if (!files.length) fail("EMPTY_CAPTURE", "The engine returned no image");
     return { ...result, structuredContent: { files } };
   }
   async exportNodes(id, token, nodeIds, format, directory2) {
     const s = this.get(id), target = await exportDirectory(directory2);
-    const prefix = `images/pencil-export-${randomUUID2()}`;
+    const prefix = `images/pencil-export-${randomUUID()}`;
     const job = { directory: target, files: [] };
     s.exportJobs.set(prefix, job);
     const output = format.startsWith("html-") ? `${prefix}/index.html` : prefix;
@@ -4043,6 +4179,7 @@ var Sessions = class {
     try {
       await Promise.all([...s.flights]);
       if (s.blocked) fail("OUTCOME_UNKNOWN", "An operation has an unknown outcome; reload the view before saving");
+      await this.waitForEditor(s, Date.now() + this.editorWait);
       const flush = await this.flush(s);
       await s.persistTail;
       if (s.savedThrough < s.mutations) fail("SAVE_NOT_READY", `The engine did not persist ${s.mutations - s.savedThrough} completed change(s); nothing was written`);
@@ -4114,8 +4251,8 @@ var Sessions = class {
       const backups = path2.join(path2.dirname(this.draftRoot), "backups");
       await fs2.mkdir(backups, { recursive: true, mode: 448 });
       const stamp = (/* @__PURE__ */ new Date()).toISOString().replace(/[:.]/g, "-");
-      const backupPath = await writeNewFile(path2.join(backups, `${path2.basename(s.file, ".pen")}-${stamp}-${randomUUID2().slice(0, 8)}.pen`), previous);
-      const temp = path2.join(path2.dirname(s.file), `.${path2.basename(s.file)}.${randomUUID2()}.tmp`);
+      const backupPath = await writeNewFile(path2.join(backups, `${path2.basename(s.file, ".pen")}-${stamp}-${randomUUID().slice(0, 8)}.pen`), previous);
+      const temp = path2.join(path2.dirname(s.file), `.${path2.basename(s.file)}.${randomUUID()}.tmp`);
       try {
         await fs2.writeFile(temp, bytes, { flag: "wx", mode: (await fs2.stat(s.file)).mode & 511 });
         if (!await unchanged()) conflict();
@@ -4238,7 +4375,7 @@ var Sessions = class {
     return null;
   }
   async atomicWrite(file, bytes) {
-    const temp = `${file}.${randomUUID2()}.tmp`;
+    const temp = `${file}.${randomUUID()}.tmp`;
     try {
       await fs2.writeFile(temp, bytes, { flag: "wx", mode: 384 });
       await fs2.rename(temp, file);
@@ -4250,7 +4387,7 @@ var Sessions = class {
 };
 
 // src/version.mjs
-var VERSION = "0.4.0";
+var VERSION = "0.5.0";
 
 // src/broker.mjs
 var same = (a, b) => {
@@ -4258,8 +4395,8 @@ var same = (a, b) => {
   const left = Buffer.from(a), right = Buffer.from(b);
   return left.length === right.length && timingSafeEqual(left, right);
 };
-async function startBroker({ token = randomUUID3(), timeout, draftRoot, saveWait, editorHtml } = {}) {
-  const sessions = new Sessions({ timeout, draftRoot, saveWait, onActivity: (id) => broadcast(id) }), views = /* @__PURE__ */ new Map();
+async function startBroker({ token = randomUUID2(), timeout, draftRoot, saveWait, editorWait, editorHtml } = {}) {
+  const sessions = new Sessions({ timeout, draftRoot, saveWait, editorWait, onActivity: (id) => broadcast(id) }), views = /* @__PURE__ */ new Map();
   let port;
   const viewUrl = (id) => `http://127.0.0.1:${port}/view/${id}/${views.get(id)}`;
   async function serveView(req, res) {
@@ -4303,13 +4440,13 @@ async function startBroker({ token = randomUUID3(), timeout, draftRoot, saveWait
       }
       const { method, args = {} } = JSON.parse(raw);
       let result;
-      if (method === "ping") result = { version: VERSION };
+      if (method === "ping") result = { version: VERSION, editorWait: sessions.editorWait, rpcTimeoutMs: sessions.rpcBudget };
       else if (method === "open" || method === "new") {
         const filename = method === "new" ? await createDocument(args.path) : args.path;
         result = await sessions.open(filename, args.scope);
-        if (!views.has(result.sessionId)) views.set(result.sessionId, randomUUID3());
+        if (!views.has(result.sessionId)) views.set(result.sessionId, randomUUID2());
         result = { ...result, editorToken: views.get(result.sessionId), viewUrl: viewUrl(result.sessionId) };
-      } else if (method === "schema") result = await sessions.request(args.sessionId, "get-mcp-schema");
+      } else if (method === "schema") result = await sessions.schema(args.sessionId);
       else if (method === "status") result = sessions.status(args.sessionId);
       else if (method === "acquire") result = sessions.acquire(args.sessionId, args.agent);
       else if (method === "release") result = sessions.release(args.sessionId, args.lease);
@@ -4345,7 +4482,7 @@ async function startBroker({ token = randomUUID3(), timeout, draftRoot, saveWait
       let generation;
       peer.sessionId = id;
       try {
-        const config = sessions.attach(id, (message) => peer.send(JSON.stringify(message)));
+        const config = sessions.attach(id, (message) => peer.send(JSON.stringify(message)), { ready: false });
         generation = config.generation;
         peer.send(JSON.stringify({ kind: "config", ...config }));
         peer.send(JSON.stringify({ kind: "activity", status: sessions.status(id) }));
@@ -4357,7 +4494,8 @@ async function startBroker({ token = randomUUID3(), timeout, draftRoot, saveWait
       peer.on("message", (bytes) => {
         try {
           const message = JSON.parse(bytes.toString());
-          if (message.kind === "response") sessions.reply(id, generation, message);
+          if (message.kind === "ready") sessions.ready(id, generation);
+          else if (message.kind === "response") sessions.reply(id, generation, message);
           else if (message.kind === "storage") {
             sessions.storage(id, generation, message.method, message.payload).then(
               (payload) => {
@@ -4399,7 +4537,7 @@ var root = fileURLToPath(new URL("../", import.meta.url));
 import * as fs3 from "node:fs/promises";
 import path3 from "node:path";
 var directory = process.argv[2];
-var broker = await startBroker({ draftRoot: path3.join(directory, "drafts"), editorHtml: path3.join(root, "dist/editor.html") });
+var broker = await startBroker({ draftRoot: path3.join(directory, "drafts"), editorWait: editorWaitFromEnv(), editorHtml: path3.join(root, "dist/editor.html") });
 await fs3.writeFile(path3.join(directory, "connection.json"), JSON.stringify({ port: broker.port, token: broker.token, pid: process.pid }), { mode: 384 });
 async function shutdown() {
   await fs3.unlink(path3.join(directory, "connection.json")).catch(() => {
