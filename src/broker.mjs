@@ -11,8 +11,8 @@ const same = (a, b) => {
   const left = Buffer.from(a), right = Buffer.from(b);
   return left.length === right.length && timingSafeEqual(left, right);
 };
-export async function startBroker({ token = randomUUID(), timeout, draftRoot, editorHtml } = {}) {
-  const sessions = new Sessions({ timeout, draftRoot }), views = new Map();
+export async function startBroker({ token = randomUUID(), timeout, draftRoot, saveWait, editorHtml } = {}) {
+  const sessions = new Sessions({ timeout, draftRoot, saveWait, onActivity: id => broadcast(id) }), views = new Map();
   let port;
   const viewUrl = id => `http://127.0.0.1:${port}/view/${id}/${views.get(id)}`;
   // The local view replaces the MCP App panel in hosts that do not render MCP Apps (Claude Code).
@@ -48,8 +48,8 @@ export async function startBroker({ token = randomUUID(), timeout, draftRoot, ed
         result = { ...result, editorToken: views.get(result.sessionId), viewUrl: viewUrl(result.sessionId) };
       } else if (method === 'schema') result = await sessions.request(args.sessionId, 'get-mcp-schema');
       else if (method === 'status') result = sessions.status(args.sessionId);
-      else if (method === 'acquire') { result = sessions.acquire(args.sessionId, args.agent); broadcast(args.sessionId); }
-      else if (method === 'release') { result = sessions.release(args.sessionId, args.lease); broadcast(args.sessionId); }
+      else if (method === 'acquire') result = sessions.acquire(args.sessionId, args.agent);
+      else if (method === 'release') result = sessions.release(args.sessionId, args.lease);
       else if (method === 'call') result = await sessions.call(args.sessionId, args.lease, args.tool, args.arguments, { observational: args.readOnly === true });
       else if (method === 'capture') result = await sessions.capture(args.sessionId, args.lease, args.nodeIds, args.directory);
       else if (method === 'export') result = await sessions.exportNodes(args.sessionId, args.lease, args.nodeIds, args.format, args.directory);

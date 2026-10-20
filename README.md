@@ -6,7 +6,7 @@
 </p>
 <p align="center"><em>Two login screens designed at the same time by two Claude Code sessions, each in its own Pencil document, then saved and exported with this plugin.</em></p>
 
-A Claude Code plugin that opens `.pen` design documents in the real Pencil editor, without adding another chat interface. A local Node.js service keeps one channel per design session, so several agents can share a document and reserve it for short read/edit/verify sequences.
+A Claude Code plugin that opens `.pen` design documents in the real Pencil editor, without adding another chat interface. A local Node.js service keeps one channel per design session, so several agents can work on the same document at the same time.
 
 This repository, **pencil-claude**, contains one independently installable Claude Code plugin. Its display name is **Pencil** and its identifier is `pencil`. The Codex version lives in the separate [pencil-codex](https://github.com/julien-m/pencil-codex) repository.
 
@@ -58,7 +58,16 @@ Ask Claude to use Pencil, for example: “Open /absolute/path/landing.pen in Pen
 2. The agent (or you) opens `viewUrl`. **Keep the view visible**: a page loaded or left in a hidden pane or background tab may never start the Pencil engine, and calls then time out.
 3. The agent waits until `pencil_status` reports `connected: true`, then loads the native instructions with `pencil_call` → `read_skill`.
 4. Each read/edit/verify sequence is wrapped in `pencil_begin` → `pencil_call` → `pencil_end`.
-5. To collaborate, other agents receive the `sessionId` only and use the same reservation tools. They must not open the same file under another `scope` (that is refused with `DOCUMENT_BUSY`).
+5. To collaborate, other agents receive the `sessionId` only and join with `pencil_begin`. They must not open the same file under another `scope` (that is refused with `DOCUMENT_BUSY`).
+
+### Shared sessions
+
+Exclusivity is held by the **design session**: a document belongs to one session at a time. Inside it, access is **not exclusive**: every agent that calls `pencil_begin` gets its own access token, and all of them work on the document at once.
+
+- Calls are sent to the engine immediately, without a session-wide queue. Each request carries its own correlation id, so responses can arrive in any order and still reach the right agent.
+- Because writes are no longer taken in turns, agents should split the work (for example one screen or one frame each), re-read before editing, and never modify nodes they did not create.
+- `pencil_end` gives back an agent's token; it is refused only while that agent still has calls in flight.
+- `pencil_save` and `pencil_save_as` wait only for the operations already in flight when they are called, then for the engine's autosave of their result (up to 5 s). New calls are not blocked meanwhile.
 
 Documents open only through `pencil_open` or `pencil_new`. The plugin does not register any `.pen` file association.
 
@@ -68,20 +77,20 @@ Documents open only through `pencil_open` or `pencil_new`. The plugin does not r
 |---|---|
 | `pencil_open` | Open an existing `.pen` file in a design session; returns `sessionId` and `viewUrl` |
 | `pencil_new` | Create a `.pen` file at a new absolute path (never overwrites), then open it |
-| `pencil_status` | Connection, reservation holder, save state, draft path |
+| `pencil_status` | Connection, agents currently in the session with their calls in flight, save state, draft path |
 | `pencil_tools` | Native engine tool schemas |
-| `pencil_begin` / `pencil_end` | Acquire / release the session reservation (`LEASE_BUSY` if another agent holds it) |
+| `pencil_begin` / `pencil_end` | Join / leave the shared session; each agent gets its own non-exclusive access token |
 | `pencil_call` | Call native tools: `execute`, `get_app_state`, `get_style`, `read_skill`. Pass `readOnly: true` for `execute` snippets that only read |
 | `pencil_capture` | PNG captures of node IDs, or `["document"]` for the whole design |
 | `pencil_export` | PNG, JPEG, WEBP, PDF, HTML/CSS or HTML/Tailwind export of the selected nodes |
 | `pencil_save` | Replace the original `.pen` file with the last acknowledged draft; refused if the file changed on disk since it was loaded |
 | `pencil_save_as` | Copy the last acknowledged draft to a new `.pen` file |
 
-Captures, exports, Save and Save As need a reservation. Captures, exports and Save As need an existing absolute destination and never overwrite an existing file; Save is the only tool that replaces a file, and only the session's own original. Exporting HTML/CSS and HTML/Tailwind both write `index.html`, so use separate directories for them. Engine screenshots are small previews; use `pencil_export` for full-resolution images.
+Captures, exports, Save and Save As need an access token. Captures, exports and Save As need an existing absolute destination and never overwrite an existing file; Save is the only tool that replaces a file, and only the session's own original. Exporting HTML/CSS and HTML/Tailwind both write `index.html`, so use separate directories for them. Engine screenshots are small previews; use `pencil_export` for full-resolution images.
 
 ### Agent activity
 
-The local view shows a badge with the agent label currently holding the reservation (for example “● Agent A is working on this document”), updated over the session channel. The label is chosen by the agent and is not an authenticated identity. The plugin does not create per-agent cursors or presence on the Pencil canvas.
+The local view shows a badge listing every agent in the session, marking those with calls in flight (for example “● Sub-agent 1 (working) · Sub-agent 2 (working) — 2 agents on this document”), updated over the session channel. The label is chosen by the agent and is not an authenticated identity. The plugin does not create per-agent cursors or presence on the Pencil canvas.
 
 The page contains the unmodified Pencil editor: layers, components, zoom, Sign In, Goodies and settings stay as Pencil provides them. The plugin adds a two-line header above the editor and never hides or alters Pencil's interface with CSS, DOM injection or overlays.
 
@@ -92,7 +101,7 @@ Claude Code session ──stdio──▶ MCP server (dist/server.mjs, one per se
                                    │ authenticated HTTP RPC on 127.0.0.1
                                    ▼
                      Local service (dist/daemon.mjs, one per user)
-                       • sessions, reservations, drafts
+                       • sessions, access tokens, drafts
                        • GET /view/<sessionId>/<grant>  → editor page
                        • WebSocket /editor              → session channel
                                    ▲
@@ -101,7 +110,7 @@ Browser view (127.0.0.1) ──────────┘   iframe: https://app
 ```
 
 - The first MCP server to start spawns the detached local service; later sessions reuse it, which is how agents in different Claude Code sessions share a design session. If the service restarts, MCP servers reconnect automatically on the next call (sessions are then reopened with `pencil_open`).
-- Native tool calls are serialized per session and require the current lease.
+- Native tool calls require an access token and are forwarded at once; responses are matched by request id.
 - The engine reads and writes the document through the channel; the service never decodes `.pen` contents.
 
 Source: [MCP server](src/server.mjs), [client/service bootstrap](src/client.mjs), [local service](src/broker.mjs), [sessions and storage](src/sessions.mjs), [file outputs](src/artifacts.mjs), [editor view](web/editor.mjs).
@@ -120,14 +129,13 @@ Source: [MCP server](src/server.mjs), [client/service bootstrap](src/client.mjs)
 - The service listens on `127.0.0.1` only. RPC requires a random bearer token; each editor view gets a separate random grant restricted to its session, and only one view can be attached to a session at a time.
 - `viewUrl` contains that grant. Anyone on the machine who has the URL can open the session view, so do not share or publish it. The view page is served with `Referrer-Policy: no-referrer`, `Cache-Control: no-store` and a nonce-based Content Security Policy that only allows frames from `https://app.pen.dev` and a WebSocket to the local service.
 - No API key is bundled; tokens are generated at runtime. Documents stay local, but their contents are processed by the hosted Pencil editor. Review pen.dev's terms before using sensitive documents.
-- Reservations coordinate agents; they do not lock manual edits in the editor. Do not run automated edits while someone edits by hand.
+- Access tokens identify agents; they lock nothing, neither between agents nor against manual edits in the editor. Split the work between agents and do not run automated edits while someone edits by hand.
 
 ## Verified behavior and limits
 
 Verified on macOS with Claude Code 2.1.296, the plugin installed from a local checkout of this repository with `claude plugin install`, and the view opened in the Claude desktop app's Browser pane:
 
-- A Claude Code session loaded the installed plugin, opened a document with `pencil_open`, and reserved it; the badge showed its label.
-- Two independent agent processes (Codex CLI runs connected to this plugin's installed MCP server and data directory) shared one design session: agent A created a hero and kept the reservation; agent B's `pencil_begin` was refused with `LEASE_BUSY: Document reserved by Agent A`; after release, agent B read the document, preserved agent A's nodes, added a features section, captured the document and a component, and after a service restart reopened the same scope, saved a new file with `pencil_save_as` (a second Save As to the same path was refused) and exported a PDF. The original file was unchanged.
+- A design session survived a restart of the local service: reopening the same file with the same scope reloaded both agents' work from the draft; `pencil_save_as` then wrote a new file (a second Save As to the same path was refused) and the original was unchanged.
 - Two Claude Code sessions, each with the installed plugin, created two documents and designed the two login screens shown above at the same time; each view showed its own agent badge, and each draft contained only its own design. `pencil_save` then wrote both designs into their original files and kept backups of the previous versions.
 - Captures of a component, a screen and the whole document; exports in all six formats; document creation; Save; Save As; layers panel navigation.
 

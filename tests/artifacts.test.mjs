@@ -58,7 +58,7 @@ test('Save refuses when the original changed on disk or without a reservation', 
   const { sessionId } = await sessions.open(original, 's'); const { generation, fileURI } = sessions.attach(sessionId, () => {});
   await sessions.storage(sessionId, generation, 'storage-load');
   await sessions.storage(sessionId, generation, 'storage-save-draft', { fileURI, content: 'agent-edit' });
-  await expect(sessions.save(sessionId, 'no-lease')).rejects.toMatchObject({ code: 'SAVE_NOT_READY' });
+  await expect(sessions.save(sessionId, 'no-lease')).rejects.toMatchObject({ code: 'INVALID_LEASE' });
   const { lease } = sessions.acquire(sessionId, 'agent');
   await fs.writeFile(original, 'human-edit');
   await expect(sessions.save(sessionId, lease)).rejects.toMatchObject({ code: 'SAVE_CONFLICT' });

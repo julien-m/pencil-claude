@@ -29,7 +29,10 @@ function start(editor) {
   socket.onmessage = event => {
     const m = JSON.parse(event.data);
     if (m.kind === 'activity') {
-      document.querySelector('#activity').textContent = m.status.leaseOwner ? `● ${m.status.leaseOwner} is working on this document` : 'Agents idle · document available';
+      const agents = m.status.agents ?? [];
+      document.querySelector('#activity').textContent = agents.length
+        ? `● ${agents.map(a => a.inFlight ? `${a.agent} (working)` : a.agent).join(' · ')} — ${agents.length} agent${agents.length > 1 ? 's' : ''} on this document`
+        : 'No agent on this document';
       return;
     }
     if (m.kind === 'fatal') { show(m.message); return; }

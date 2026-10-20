@@ -10,13 +10,13 @@ The `pencil` MCP server exposes `pencil_*` tools. Documents open only through th
 1. Call `pencil_open` with an absolute `.pen` path and an explicit `scope` (or `pencil_new` with a new absolute path). Keep the returned `sessionId`.
 2. Open the returned `viewUrl` in a browser: in the Claude desktop app, open it in the built-in Browser pane and show that pane; otherwise give it to the user. Keep the view visible: a page loaded or left in a hidden pane or background tab may never start the engine. The real Pencil editor loads from `https://app.pen.dev` and connects to the local session channel.
 3. Poll `pencil_status` until `connected` is `true`. If it stays `false`, report it; do not edit the `.pen` file directly.
-4. For each read/edit/verify sequence: `pencil_begin` (with a short `agent` label) → `pencil_call` → `pencil_end`. On `LEASE_BUSY`, wait, then re-read the document before editing.
+4. Join with `pencil_begin` (short `agent` label) to get your own access token, use `pencil_call`, and leave with `pencil_end` when your work is verified. Access is not exclusive: other agents may edit the same document at the same time, so re-read before each edit and only change nodes you created.
 5. Before the first edit, call `pencil_call` with `read_skill`, then `get_app_state`; use `pencil_tools` for native schemas. Pass `readOnly: true` to `pencil_call` for `execute` snippets that only read (Get/Print), so the save state is kept.
-6. To collaborate, give other agents the `sessionId` only. They use `pencil_begin`/`pencil_call`/`pencil_end` with it; they must not open the same file under another scope, and they must read and preserve existing work.
+6. To collaborate, give other agents the `sessionId` only and split the work (for example one screen each). They join with `pencil_begin`; they must not open the same file under another scope, and they must preserve existing work.
 
 Rules:
 - `.pen` files are opaque: never read or write them with file tools.
-- Captures (`pencil_capture`), exports (`pencil_export`) and `pencil_save_as` need a lease and an existing absolute destination; they never overwrite.
+- Captures (`pencil_capture`), exports (`pencil_export`) and `pencil_save_as` need an access token and an existing absolute destination; they never overwrite. `pencil_save` and `pencil_save_as` wait for the calls in flight and the engine autosave before writing.
 - Edits go to a draft in the plugin data directory until saved. After `saveState` is `draft-saved`, use `pencil_save` to write the original file (refused with `SAVE_CONFLICT` if it changed on disk; then use `pencil_save_as`), or `pencil_save_as` for a new file. Save only when the user asked for it or the task implies keeping the result in that file.
 - After `OUTCOME_UNKNOWN`, never replay the mutation. Reload the view: the new view reloads the last saved draft and unblocks the session (`recoveries` increases). Re-read the document before any further edit.
 - `Generate(...)` (asynchronous generation) is unsupported.

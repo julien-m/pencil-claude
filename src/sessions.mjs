@@ -11,7 +11,9 @@ export class SessionError extends Error {
 const fail = (code, message) => { throw new SessionError(code, message); };
 
 export class Sessions {
-  constructor({ timeout = 15000, draftRoot = path.join(os.tmpdir(), 'pencil-drafts') } = {}) { this.items = new Map(); this.timeout = timeout; this.draftRoot = draftRoot; }
+  constructor({ timeout = 15000, draftRoot = path.join(os.tmpdir(), 'pencil-drafts'), saveWait = 5000, onActivity = () => {} } = {}) {
+    this.items = new Map(); this.timeout = timeout; this.draftRoot = draftRoot; this.saveWait = saveWait; this.onActivity = onActivity;
+  }
   get(id) { return this.items.get(id) ?? fail('SESSION_NOT_FOUND', 'Unknown session'); }
   async open(filename, scope) {
     if (!path.isAbsolute(filename) || path.extname(filename).toLowerCase() !== '.pen') fail('INVALID_PATH', 'An absolute .pen file path is required');
@@ -26,13 +28,14 @@ export class Sessions {
     }
     const id = randomUUID();
     const draft = path.join(this.draftRoot, `${digest(`${scope}:${file}`)}.pen`);
-    const s = { id, scope, file, draft, exportJobs: new Map(), writeEpoch: 0, virtualRoot: `pencil/${id}/`, generation: 0, pending: new Map(), lease: null, tail: Promise.resolve(), blocked: false, connected: false, savedHash: null, operations: 0, recoveries: 0, saveState: 'not-loaded' };
+    const s = { id, scope, file, draft, exportJobs: new Map(), writeEpoch: 0, virtualRoot: `pencil/${id}/`, generation: 0, pending: new Map(), leases: new Map(), flights: new Set(), saveWaiters: new Set(), blocked: false, connected: false, savedHash: null, operations: 0, recoveries: 0, saveState: 'not-loaded' };
     this.items.set(id, s);
     return this.status(id);
   }
   status(id) {
     const s = this.get(id);
-    return { sessionId: s.id, scope: s.scope, name: path.basename(s.file), connected: s.connected, generation: s.generation, blocked: s.blocked, leaseOwner: s.lease?.agent ?? null, operations: s.operations, recoveries: s.recoveries, saveState: s.saveState, draftPath: s.draft };
+    const agents = [...s.leases.values()].map(({ agent, inFlight }) => ({ agent, inFlight }));
+    return { sessionId: s.id, scope: s.scope, name: path.basename(s.file), connected: s.connected, generation: s.generation, blocked: s.blocked, agents, inFlight: s.flights.size, operations: s.operations, recoveries: s.recoveries, saveState: s.saveState, draftPath: s.draft };
   }
   attach(id, send) {
     const s = this.get(id);
@@ -51,39 +54,56 @@ export class Sessions {
     if (s.pending.size) s.blocked = true;
     s.pending.clear();
   }
+  // Exclusivity belongs to the design session (one per document); each agent gets its own
+  // non-exclusive access to it, so several agents work on the shared document at once.
   acquire(id, agent) {
     const s = this.get(id);
     if (s.blocked) fail('OUTCOME_UNKNOWN', 'Session blocked after an unknown outcome');
-    if (s.lease) fail('LEASE_BUSY', `Document reserved by ${s.lease.agent}`);
-    s.lease = { token: randomUUID(), agent };
-    return { lease: s.lease.token, ...this.status(id) };
+    const lease = randomUUID();
+    s.leases.set(lease, { agent, inFlight: 0 });
+    this.onActivity(id);
+    return { lease, ...this.status(id) };
   }
   release(id, token) {
-    const s = this.get(id);
-    if (s.lease?.token !== token) fail('INVALID_LEASE', 'Invalid reservation');
-    if (s.pending.size || s.queued) fail('CALLS_IN_FLIGHT', 'Calls are still in progress');
-    if (s.blocked) fail('OUTCOME_UNKNOWN', 'Do not release a reservation with an operation of unknown outcome');
-    s.lease = null;
+    const s = this.get(id), access = s.leases.get(token) ?? fail('INVALID_LEASE', 'Invalid access token');
+    if (access.inFlight) fail('CALLS_IN_FLIGHT', 'This agent still has calls in progress');
+    s.leases.delete(token);
+    this.onActivity(id);
     return this.status(id);
   }
-  call(id, token, name, args = {}, { observational = false } = {}) {
-    const s = this.get(id);
-    if (s.lease?.token !== token) fail('INVALID_LEASE', 'Reserve the document before calling tools');
+  access(s, token) { return s.leases.get(token) ?? fail('INVALID_LEASE', 'Call pencil_begin before calling tools'); }
+  // Calls are sent immediately, without a session-wide queue; each request carries its own
+  // correlation id, so responses may arrive in any order.
+  async call(id, token, name, args = {}, { observational = false } = {}) {
+    const s = this.get(id), access = this.access(s, token);
     if (!['execute', 'read_skill', 'get_style', 'get_app_state'].includes(name)) fail('TOOL_NOT_ALLOWED', 'Tool not exposed by this plugin');
     // Generation and execution are mixed in execute; async generation is excluded from this version.
     if (name === 'execute' && /\bGenerate\s*\(/.test(args.input ?? '')) fail('ASYNC_UNSUPPORTED', 'Asynchronous generation is not supported in this version');
-    s.queued = (s.queued ?? 0) + 1;
-    const result = s.tail.then(async () => {
-      if (s.blocked) fail('OUTCOME_UNKNOWN', 'Session blocked; do not replay mutations');
-      if (s.lease?.token !== token) fail('INVALID_LEASE', 'Stale reservation');
-      const writeEpoch = s.writeEpoch;
-      const response = await this.request(id, 'mcp-tool-call', { name, arguments: args });
+    if (s.blocked) fail('OUTCOME_UNKNOWN', 'Session blocked; do not replay mutations');
+    const writeEpoch = s.writeEpoch;
+    const flight = this.request(id, 'mcp-tool-call', { name, arguments: args });
+    const settled = flight.catch(() => {});
+    s.flights.add(settled); access.inFlight += 1; this.onActivity(id);
+    try {
+      const response = await flight;
       s.operations += 1;
       if (name === 'execute' && !observational && s.writeEpoch === writeEpoch) s.saveState = 'check-required';
       return response;
-    });
-    s.tail = result.catch(() => {});
-    return result.finally(() => { s.queued -= 1; });
+    } finally { s.flights.delete(settled); access.inFlight -= 1; this.onActivity(id); }
+  }
+  // Save waits only for the operations in flight when it is requested, then for the engine's
+  // autosave of their result (bounded by saveWait), and never blocks new calls.
+  async settle(s) {
+    await Promise.all([...s.flights]);
+    if (s.saveState === 'check-required') {
+      await new Promise(resolve => {
+        const waiter = () => { clearTimeout(timer); s.saveWaiters.delete(waiter); resolve(); };
+        const timer = setTimeout(waiter, this.saveWait);
+        s.saveWaiters.add(waiter);
+      });
+    }
+    if (s.blocked) fail('OUTCOME_UNKNOWN', 'An operation has an unknown outcome; reload the view before saving');
+    if (s.saveState !== 'draft-saved' && s.saveState !== 'host-saved') fail('SAVE_NOT_READY', `No engine save acknowledged (saveState: ${s.saveState})`);
   }
   request(id, method, payload) {
     const s = this.get(id);
@@ -136,19 +156,17 @@ export class Sessions {
     } finally { s.exportJobs.delete(prefix); }
   }
   async saveAs(id, token, filename) {
-    const s = this.get(id);
-    if (s.lease?.token !== token || s.pending.size || s.queued || s.blocked) fail('SAVE_NOT_READY', 'Reserve the session and wait for pending operations');
-    if (s.saveState !== 'draft-saved' && s.saveState !== 'host-saved') fail('SAVE_NOT_READY', 'Wait for an engine save acknowledgement before Save As');
+    const s = this.get(id); this.access(s, token);
     if (path.extname(filename).toLowerCase() !== '.pen') fail('INVALID_PATH', 'Choose a new .pen file');
+    await this.settle(s);
     const saved = await writeNewFile(filename, await fs.readFile(s.draft));
     return { path: saved, sessionId: id, sourceUnchanged: true };
   }
   // Replace the original with the acknowledged draft, only if nobody changed it since the engine loaded it.
   // The previous version is kept in backups/ first; a final hash check runs right before the atomic rename.
   async save(id, token) {
-    const s = this.get(id);
-    if (s.lease?.token !== token || s.pending.size || s.queued || s.blocked) fail('SAVE_NOT_READY', 'Reserve the session and wait for pending operations');
-    if (s.saveState !== 'draft-saved' && s.saveState !== 'host-saved') fail('SAVE_NOT_READY', 'Wait for an engine save acknowledgement before saving');
+    const s = this.get(id); this.access(s, token);
+    await this.settle(s);
     const unchanged = async () => s.savedHash !== null && digest(await fs.readFile(s.file)) === s.savedHash;
     const conflict = () => { s.saveState = 'conflict'; fail('SAVE_CONFLICT', 'The original file changed since it was loaded; nothing was replaced. Use Save As'); };
     if (!await unchanged()) conflict();
@@ -183,7 +201,9 @@ export class Sessions {
       // Engine autosaves only update the draft; the original changes through save().
       await fs.mkdir(this.draftRoot, { recursive: true, mode: 0o700 });
       await this.atomicWrite(s.draft, Buffer.from(payload.content));
-      s.writeEpoch += 1; s.saveState = 'draft-saved'; return 0;
+      s.writeEpoch += 1; s.saveState = 'draft-saved';
+      for (const waiter of [...s.saveWaiters]) waiter();
+      return 0;
     }
     if (!['storage-read-asset', 'storage-write-asset', 'storage-has-asset'].includes(method)) fail('METHOD_NOT_ALLOWED', `Unknown storage operation: ${method}`);
     const key = payload?.path;

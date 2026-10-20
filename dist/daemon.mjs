@@ -3803,10 +3803,13 @@ var fail = (code, message) => {
   throw new SessionError(code, message);
 };
 var Sessions = class {
-  constructor({ timeout = 15e3, draftRoot = path2.join(os.tmpdir(), "pencil-drafts") } = {}) {
+  constructor({ timeout = 15e3, draftRoot = path2.join(os.tmpdir(), "pencil-drafts"), saveWait = 5e3, onActivity = () => {
+  } } = {}) {
     this.items = /* @__PURE__ */ new Map();
     this.timeout = timeout;
     this.draftRoot = draftRoot;
+    this.saveWait = saveWait;
+    this.onActivity = onActivity;
   }
   get(id) {
     return this.items.get(id) ?? fail("SESSION_NOT_FOUND", "Unknown session");
@@ -3824,13 +3827,14 @@ var Sessions = class {
     }
     const id = randomUUID2();
     const draft = path2.join(this.draftRoot, `${digest(`${scope}:${file}`)}.pen`);
-    const s = { id, scope, file, draft, exportJobs: /* @__PURE__ */ new Map(), writeEpoch: 0, virtualRoot: `pencil/${id}/`, generation: 0, pending: /* @__PURE__ */ new Map(), lease: null, tail: Promise.resolve(), blocked: false, connected: false, savedHash: null, operations: 0, recoveries: 0, saveState: "not-loaded" };
+    const s = { id, scope, file, draft, exportJobs: /* @__PURE__ */ new Map(), writeEpoch: 0, virtualRoot: `pencil/${id}/`, generation: 0, pending: /* @__PURE__ */ new Map(), leases: /* @__PURE__ */ new Map(), flights: /* @__PURE__ */ new Set(), saveWaiters: /* @__PURE__ */ new Set(), blocked: false, connected: false, savedHash: null, operations: 0, recoveries: 0, saveState: "not-loaded" };
     this.items.set(id, s);
     return this.status(id);
   }
   status(id) {
     const s = this.get(id);
-    return { sessionId: s.id, scope: s.scope, name: path2.basename(s.file), connected: s.connected, generation: s.generation, blocked: s.blocked, leaseOwner: s.lease?.agent ?? null, operations: s.operations, recoveries: s.recoveries, saveState: s.saveState, draftPath: s.draft };
+    const agents = [...s.leases.values()].map(({ agent, inFlight }) => ({ agent, inFlight }));
+    return { sessionId: s.id, scope: s.scope, name: path2.basename(s.file), connected: s.connected, generation: s.generation, blocked: s.blocked, agents, inFlight: s.flights.size, operations: s.operations, recoveries: s.recoveries, saveState: s.saveState, draftPath: s.draft };
   }
   attach(id, send) {
     const s = this.get(id);
@@ -3853,41 +3857,68 @@ var Sessions = class {
     if (s.pending.size) s.blocked = true;
     s.pending.clear();
   }
+  // Exclusivity belongs to the design session (one per document); each agent gets its own
+  // non-exclusive access to it, so several agents work on the shared document at once.
   acquire(id, agent) {
     const s = this.get(id);
     if (s.blocked) fail("OUTCOME_UNKNOWN", "Session blocked after an unknown outcome");
-    if (s.lease) fail("LEASE_BUSY", `Document reserved by ${s.lease.agent}`);
-    s.lease = { token: randomUUID2(), agent };
-    return { lease: s.lease.token, ...this.status(id) };
+    const lease = randomUUID2();
+    s.leases.set(lease, { agent, inFlight: 0 });
+    this.onActivity(id);
+    return { lease, ...this.status(id) };
   }
   release(id, token) {
-    const s = this.get(id);
-    if (s.lease?.token !== token) fail("INVALID_LEASE", "Invalid reservation");
-    if (s.pending.size || s.queued) fail("CALLS_IN_FLIGHT", "Calls are still in progress");
-    if (s.blocked) fail("OUTCOME_UNKNOWN", "Do not release a reservation with an operation of unknown outcome");
-    s.lease = null;
+    const s = this.get(id), access2 = s.leases.get(token) ?? fail("INVALID_LEASE", "Invalid access token");
+    if (access2.inFlight) fail("CALLS_IN_FLIGHT", "This agent still has calls in progress");
+    s.leases.delete(token);
+    this.onActivity(id);
     return this.status(id);
   }
-  call(id, token, name, args = {}, { observational = false } = {}) {
-    const s = this.get(id);
-    if (s.lease?.token !== token) fail("INVALID_LEASE", "Reserve the document before calling tools");
+  access(s, token) {
+    return s.leases.get(token) ?? fail("INVALID_LEASE", "Call pencil_begin before calling tools");
+  }
+  // Calls are sent immediately, without a session-wide queue; each request carries its own
+  // correlation id, so responses may arrive in any order.
+  async call(id, token, name, args = {}, { observational = false } = {}) {
+    const s = this.get(id), access2 = this.access(s, token);
     if (!["execute", "read_skill", "get_style", "get_app_state"].includes(name)) fail("TOOL_NOT_ALLOWED", "Tool not exposed by this plugin");
     if (name === "execute" && /\bGenerate\s*\(/.test(args.input ?? "")) fail("ASYNC_UNSUPPORTED", "Asynchronous generation is not supported in this version");
-    s.queued = (s.queued ?? 0) + 1;
-    const result = s.tail.then(async () => {
-      if (s.blocked) fail("OUTCOME_UNKNOWN", "Session blocked; do not replay mutations");
-      if (s.lease?.token !== token) fail("INVALID_LEASE", "Stale reservation");
-      const writeEpoch = s.writeEpoch;
-      const response = await this.request(id, "mcp-tool-call", { name, arguments: args });
+    if (s.blocked) fail("OUTCOME_UNKNOWN", "Session blocked; do not replay mutations");
+    const writeEpoch = s.writeEpoch;
+    const flight = this.request(id, "mcp-tool-call", { name, arguments: args });
+    const settled = flight.catch(() => {
+    });
+    s.flights.add(settled);
+    access2.inFlight += 1;
+    this.onActivity(id);
+    try {
+      const response = await flight;
       s.operations += 1;
       if (name === "execute" && !observational && s.writeEpoch === writeEpoch) s.saveState = "check-required";
       return response;
-    });
-    s.tail = result.catch(() => {
-    });
-    return result.finally(() => {
-      s.queued -= 1;
-    });
+    } finally {
+      s.flights.delete(settled);
+      access2.inFlight -= 1;
+      this.onActivity(id);
+    }
+  }
+  // Save waits only for the operations in flight when it is requested, then for the engine's
+  // autosave of their result (bounded by saveWait), and never blocks new calls.
+  async settle(s) {
+    await Promise.all([...s.flights]);
+    if (s.saveState === "check-required") {
+      await new Promise((resolve) => {
+        const waiter = () => {
+          clearTimeout(timer);
+          s.saveWaiters.delete(waiter);
+          resolve();
+        };
+        const timer = setTimeout(waiter, this.saveWait);
+        s.saveWaiters.add(waiter);
+      });
+    }
+    if (s.blocked) fail("OUTCOME_UNKNOWN", "An operation has an unknown outcome; reload the view before saving");
+    if (s.saveState !== "draft-saved" && s.saveState !== "host-saved") fail("SAVE_NOT_READY", `No engine save acknowledged (saveState: ${s.saveState})`);
   }
   request(id, method, payload) {
     const s = this.get(id);
@@ -3957,9 +3988,9 @@ var Sessions = class {
   }
   async saveAs(id, token, filename) {
     const s = this.get(id);
-    if (s.lease?.token !== token || s.pending.size || s.queued || s.blocked) fail("SAVE_NOT_READY", "Reserve the session and wait for pending operations");
-    if (s.saveState !== "draft-saved" && s.saveState !== "host-saved") fail("SAVE_NOT_READY", "Wait for an engine save acknowledgement before Save As");
+    this.access(s, token);
     if (path2.extname(filename).toLowerCase() !== ".pen") fail("INVALID_PATH", "Choose a new .pen file");
+    await this.settle(s);
     const saved = await writeNewFile(filename, await fs2.readFile(s.draft));
     return { path: saved, sessionId: id, sourceUnchanged: true };
   }
@@ -3967,8 +3998,8 @@ var Sessions = class {
   // The previous version is kept in backups/ first; a final hash check runs right before the atomic rename.
   async save(id, token) {
     const s = this.get(id);
-    if (s.lease?.token !== token || s.pending.size || s.queued || s.blocked) fail("SAVE_NOT_READY", "Reserve the session and wait for pending operations");
-    if (s.saveState !== "draft-saved" && s.saveState !== "host-saved") fail("SAVE_NOT_READY", "Wait for an engine save acknowledgement before saving");
+    this.access(s, token);
+    await this.settle(s);
     const unchanged = async () => s.savedHash !== null && digest(await fs2.readFile(s.file)) === s.savedHash;
     const conflict = () => {
       s.saveState = "conflict";
@@ -4019,6 +4050,7 @@ var Sessions = class {
       await this.atomicWrite(s.draft, Buffer.from(payload.content));
       s.writeEpoch += 1;
       s.saveState = "draft-saved";
+      for (const waiter of [...s.saveWaiters]) waiter();
       return 0;
     }
     if (!["storage-read-asset", "storage-write-asset", "storage-has-asset"].includes(method)) fail("METHOD_NOT_ALLOWED", `Unknown storage operation: ${method}`);
@@ -4081,7 +4113,7 @@ var Sessions = class {
 };
 
 // src/version.mjs
-var VERSION = "0.2.0";
+var VERSION = "0.3.0";
 
 // src/broker.mjs
 var same = (a, b) => {
@@ -4089,8 +4121,8 @@ var same = (a, b) => {
   const left = Buffer.from(a), right = Buffer.from(b);
   return left.length === right.length && timingSafeEqual(left, right);
 };
-async function startBroker({ token = randomUUID3(), timeout, draftRoot, editorHtml } = {}) {
-  const sessions = new Sessions({ timeout, draftRoot }), views = /* @__PURE__ */ new Map();
+async function startBroker({ token = randomUUID3(), timeout, draftRoot, saveWait, editorHtml } = {}) {
+  const sessions = new Sessions({ timeout, draftRoot, saveWait, onActivity: (id) => broadcast(id) }), views = /* @__PURE__ */ new Map();
   let port;
   const viewUrl = (id) => `http://127.0.0.1:${port}/view/${id}/${views.get(id)}`;
   async function serveView(req, res) {
@@ -4142,13 +4174,9 @@ async function startBroker({ token = randomUUID3(), timeout, draftRoot, editorHt
         result = { ...result, editorToken: views.get(result.sessionId), viewUrl: viewUrl(result.sessionId) };
       } else if (method === "schema") result = await sessions.request(args.sessionId, "get-mcp-schema");
       else if (method === "status") result = sessions.status(args.sessionId);
-      else if (method === "acquire") {
-        result = sessions.acquire(args.sessionId, args.agent);
-        broadcast(args.sessionId);
-      } else if (method === "release") {
-        result = sessions.release(args.sessionId, args.lease);
-        broadcast(args.sessionId);
-      } else if (method === "call") result = await sessions.call(args.sessionId, args.lease, args.tool, args.arguments, { observational: args.readOnly === true });
+      else if (method === "acquire") result = sessions.acquire(args.sessionId, args.agent);
+      else if (method === "release") result = sessions.release(args.sessionId, args.lease);
+      else if (method === "call") result = await sessions.call(args.sessionId, args.lease, args.tool, args.arguments, { observational: args.readOnly === true });
       else if (method === "capture") result = await sessions.capture(args.sessionId, args.lease, args.nodeIds, args.directory);
       else if (method === "export") result = await sessions.exportNodes(args.sessionId, args.lease, args.nodeIds, args.format, args.directory);
       else if (method === "save") result = await sessions.save(args.sessionId, args.lease);
