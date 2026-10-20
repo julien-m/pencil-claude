@@ -137,12 +137,14 @@ Verified on macOS with Claude Code 2.1.296, the plugin installed from a local ch
 
 - A design session survived a restart of the local service: reopening the same file with the same scope reloaded both agents' work from the draft; `pencil_save_as` then wrote a new file (a second Save As to the same path was refused) and the original was unchanged.
 - Two Claude Code sessions, each with the installed plugin, created two documents and designed the two login screens shown above at the same time; each view showed its own agent badge, and each draft contained only its own design. `pencil_save` then wrote both designs into their original files and kept backups of the previous versions.
+- Two sub-agents of one Claude Code session joined the same design session and each designed a different screen in the same document at the same time: both were listed together in the session, their calls interleaved without waiting, each saw the other's frame appear while working, and neither touched the other's nodes. A direct probe sent two slow calls from two agents at once: the plugin had both in flight together (`inFlight: 2`), the second answer came back first and each answer reached its own caller.
 - Captures of a component, a screen and the whole document; exports in all six formats; document creation; Save; Save As; layers panel navigation.
 
 Known limits:
 
 - No embedded panel in Claude Code (see above); the MCP Apps resource is untested with Claude.
 - The view must stay visible while agents work. An unanswered call times out after 15 s with `OUTCOME_UNKNOWN` and blocks the session. Never replay that mutation: reload the view, which reloads the last saved draft and unblocks the session (`recoveries` increases); then re-read before editing.
+- The plugin forwards calls in parallel, but the hosted Pencil engine runs `execute` snippets one after another: two simultaneous calls overlap in the plugin and complete one after the other in the engine.
 - Asynchronous generation (`Generate(...)`) is not supported.
 - External `.pen` libraries and the editor's document-library requests (such as `documents-list`) are not implemented; open and create documents with the plugin tools.
 - Two views of different documents can be open at once. A view that was loaded while visible kept working from a background tab during the test; a view first loaded in a hidden pane did not start the engine.
