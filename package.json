@@ -1,0 +1,30 @@
+{
+  "name": "pencil",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "bun test tests/sessions.test.mjs tests/artifacts.test.mjs tests/manifest.test.mjs --timeout 2000 && node --test --test-timeout=2000 tests/broker.test.mjs",
+    "test:protocol": "node tests/protocol.mjs",
+    "start": "node src/server.mjs",
+    "preview": "node src/preview.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "@modelcontextprotocol/ext-apps": "2.0.3",
+    "ws": "8.22.0",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/julien-m/pencil-claude.git"
+  }
+}

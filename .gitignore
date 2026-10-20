@@ -1,0 +1,9 @@
+node_modules/
+.runtime/
+coverage/
+.env
+.env.*
+!.env.example
+.DS_Store
+.claude/
+*.log
