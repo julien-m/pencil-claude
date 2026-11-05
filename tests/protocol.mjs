@@ -15,6 +15,8 @@ try {
   assert.equal(opener._meta.ui.resourceUri, 'ui://pencil/editor-v1.html');
     assert(opener.inputSchema.required.includes('path'));
   assert(!tools.some(x => x.name === 'pencil_attach_file'));
+  for (const name of ['pencil_selection', 'pencil_documents']) assert(tools.some(x => x.name === name), name);
+  assert(!tools.some(x => /^pencil_(generate|generation_)/.test(x.name)));
   assert.equal(tools.find(x => x.name === 'pencil_save').annotations.destructiveHint, true);
   const ui = await client.readResource({ uri: 'ui://pencil/editor-v1.html' });
   assert(ui.contents[0].text.includes('Pencil editor'));
@@ -29,6 +31,13 @@ try {
   const status = await client.callTool({ name: 'pencil_status', arguments: { sessionId: opened.structuredContent.sessionId } });
   assert.equal(status.structuredContent.connected, false);
   const sessionId = opened.structuredContent.sessionId;
+  const selected = await client.callTool({ name: 'pencil_selection', arguments: { sessionId } });
+  assert.equal(selected.structuredContent.available, false);
+  const draft = await client.callTool({ name: 'pencil_new', arguments: { scope: 'persistent-draft' } });
+  assert(!draft.isError, draft.content?.[0]?.text);
+  const docs = await client.callTool({ name: 'pencil_documents', arguments: {} });
+  assert.equal(docs.structuredContent.documents.length, 1);
+  assert((await fs.stat(docs.structuredContent.documents[0].path)).isFile());
   const participants = await Promise.all(['A', 'B'].map(agent => client.callTool({ name: 'pencil_begin', arguments: { sessionId, agent } })));
   assert(participants.every(p => !p.isError));
   assert.deepEqual((await client.callTool({ name: 'pencil_status', arguments: { sessionId } })).structuredContent.agents.map(a => a.agent), ['A', 'B']);

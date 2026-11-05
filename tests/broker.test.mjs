@@ -21,6 +21,14 @@ test('real loopback transport authenticates and routes one editor without broadc
     const leases = await Promise.all(sessions.map((s, i) => rpc('acquire', { sessionId: s.sessionId, agent: `agent-${i}` })));
     const results = await Promise.all(sessions.map((s, i) => rpc('call', { sessionId: s.sessionId, lease: leases[i].lease, tool: 'get_app_state', arguments: {} })));
     assert.deepEqual(results.map(x => x.content[0].text), ['a', 'b']);
+    const nodes = [{ id: crypto.randomUUID(), type: 'frame', name: 'User selection' }];
+    const selected = new Promise(resolve => peers[0].on('message', bytes => {
+      const message = JSON.parse(bytes);
+      if (message.kind === 'activity' && message.status.selection.available) resolve(message.status.selection);
+    }));
+    peers[0].send(JSON.stringify({ kind: 'notification', method: 'selection-changed', payload: { nodes } }));
+    assert.deepEqual((await selected).nodes, nodes);
+    assert.equal((await rpc('status', { sessionId: sessions[1].sessionId })).selection.available, false);
   } finally { for (const p of peers) p.terminate(); await b.close(); await fs.rm(dir, { recursive: true, force: true }); }
 });
 test('local view requires the session grant and is served with a restrictive policy', async () => {
@@ -85,4 +93,29 @@ test('MCP clients use the deadline advertised by the service, not their own envi
     assert.equal(client.rpcTimeoutMs, b.sessions.rpcBudget);
     assert(client.rpcTimeoutMs > client.editorWait + b.sessions.timeout);
   } finally { if (previous === undefined) delete process.env.PENCIL_EDITOR_WAIT_MS; else process.env.PENCIL_EDITOR_WAIT_MS = previous; await b.close(); await fs.rm(dir, { recursive: true, force: true }); }
+});
+
+test('catalog drafts retain autosaved work after a broker restart and a different conversation scope', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pencil-catalog-'));
+  const options = { draftRoot: path.join(dir, 'drafts') }; let broker;
+  const rpc = async (method, args = {}) => {
+    const body = await (await fetch(`http://127.0.0.1:${broker.port}/rpc`, { method: 'POST', headers: { Authorization: `Bearer ${broker.token}` }, body: JSON.stringify({ method, args }) })).json();
+    if (body.error) throw Object.assign(new Error(body.error.message), body.error);
+    return body.result;
+  };
+  try {
+    broker = await startBroker(options);
+    const created = await rpc('new', { scope: crypto.randomUUID() });
+    const channel = broker.sessions.attach(created.sessionId, () => {});
+    const original = await broker.sessions.storage(created.sessionId, channel.generation, 'storage-load');
+    const content = JSON.stringify({ ...JSON.parse(original.content), children: [{ id: crypto.randomUUID(), type: 'frame' }] });
+    await broker.sessions.storage(created.sessionId, channel.generation, 'storage-write', { fileURI: channel.fileURI, content });
+    await broker.close(); broker = await startBroker(options);
+    const catalog = await rpc('documents'); assert.equal(catalog.documents.length, 1);
+    const reopened = await rpc('open', { path: catalog.documents[0].path, scope: crypto.randomUUID() });
+    const next = broker.sessions.attach(reopened.sessionId, () => {});
+    assert.equal((await broker.sessions.storage(reopened.sessionId, next.generation, 'storage-load')).content, content);
+    // Stable draft storage must not remove the exclusivity between live conversations.
+    await assert.rejects(rpc('open', { path: catalog.documents[0].path, scope: crypto.randomUUID() }), { code: 'DOCUMENT_BUSY' });
+  } finally { await broker?.close(); await fs.rm(dir, { recursive: true, force: true }); }
 });

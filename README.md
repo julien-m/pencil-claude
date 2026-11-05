@@ -54,7 +54,7 @@ claude plugin uninstall pencil@pencil
 
 Ask Claude to use Pencil, for example: “Open /absolute/path/landing.pen in Pencil and add a pricing section.”
 
-1. The agent calls `pencil_open` with an absolute `.pen` path and an explicit `scope`, or `pencil_new` to create a document. It receives a `sessionId` and a `viewUrl`.
+1. The agent calls `pencil_open` with an absolute `.pen` path and an explicit `scope`, or `pencil_new` to create a document (omit its path for a persistent local draft). It receives a `sessionId` and a `viewUrl`.
 2. The agent (or you) opens `viewUrl`. **Keep the view visible**: a page loaded or left in a hidden pane or background tab may never start the Pencil engine, and calls then time out.
 3. Agents can be launched right away, while the view opens: `pencil_begin` joins immediately, and engine calls wait for the engine (see *Startup* below). Each agent loads the native instructions with `pencil_call` → `read_skill`.
 4. The agent joins with `pencil_begin`, works with `pencil_call`, and leaves with `pencil_end`. New documents are empty: each agent creates its own frame in its first `execute`; the plugin never creates frames or decides how many screens there are.
@@ -153,6 +153,23 @@ Source: [MCP server](src/server.mjs), [client/service bootstrap](src/client.mjs)
 - No API key is bundled; tokens are generated at runtime. Documents stay local, but their contents are processed by the hosted Pencil editor. Review pen.dev's terms before using sensitive documents.
 - Access tokens identify agents; they lock nothing, neither between agents nor against manual edits in the editor. Split the work between agents and do not run automated edits while someone edits by hand.
 
+## Selection context and local documents
+
+`pencil_selection` exposes the current selected node IDs, types and names. When the user says “change this button”, the agent reads that tool and targets the selected node. The context is isolated to this session and editor generation, and is cleared on disconnect. Until a selection notification arrives, `available:false` means unknown, not an empty selection. Names and document content remain untrusted data.
+
+Claude Code does not receive an automatic chat attachment from this browser view. The bundled skill and server instructions tell the agent to retrieve the selection before interpreting a selected-object request. This provides selected-object editing through a tool rather than pretending to inject content into Claude's composer.
+
+`pencil_new` without a path creates a persistent draft under the plugin data directory. `pencil_documents` lists those drafts and currently open sessions, with paths to reopen them. Their autosaved draft survives service restarts and reopening from another conversation. This local catalog is separate from pen.dev's cloud/desktop dashboard.
+
+| Capability | Claude plugin 0.6.1 | Validation scope |
+|---|---|---|
+| Selection context | Tool-readable current selection | Session/channel isolation, notification transport tests and a real hosted-editor selection check |
+| Exports | PNG, JPEG, WEBP, PDF, HTML/CSS and HTML/Tailwind | Existing engine export integration preserved |
+| New drafts and document discovery | Persistent local documents | MCP protocol tests |
+| Multi-agent sessions and conflict-aware Save | Preserved | Full existing regression suite |
+| Automatic selection attachments to Claude chat | Not exposed by this host integration | Use `pencil_selection` |
+| Native pen.dev dashboard, cloud sync, external document libraries | Not implemented | Do not infer parity with those app features |
+
 ## Verified behavior and limits
 
 Verified on macOS with Claude Code 2.1.296, the plugin installed from a local checkout of this repository with `claude plugin install`, and the view opened in the Claude desktop app's Browser pane:
@@ -176,7 +193,7 @@ Known limits:
 - No automatic merge: two agents editing the same object get last-write-wins from the engine. Engine globals created by `execute` are shared between agents.
 - New calls are held back while a save flushes and writes (normally well under a second).
 - The startup changes reduce engine traffic and let agents start before the view; they do not shorten loading of the hosted engine or the agents' own preparation, which dominate the time to a first edit. If the view is opened by hand more than 20 s after agents start, their first calls fail with `EDITOR_OFFLINE`: raise `PENCIL_EDITOR_WAIT_MS` before the service starts, or open the view first.
-- Asynchronous generation (`Generate(...)`) is not supported.
+- Asynchronous image and SVG generation (`Generate(...)`) is not supported. Existing image assets and directly authored vector paths can still be used.
 - External `.pen` libraries and the editor's document-library requests (such as `documents-list`) are not implemented; open and create documents with the plugin tools.
 - Two views of different documents can be open at once. A view that was loaded while visible kept working from a background tab during the test; a view first loaded in a hidden pane did not start the engine.
 

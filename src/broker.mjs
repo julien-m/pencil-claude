@@ -1,5 +1,6 @@
 import http from 'node:http';
-import { readFile } from 'node:fs/promises';
+import { readFile, mkdir, readdir, stat, realpath } from 'node:fs/promises';
+import path from 'node:path';
 import { WebSocketServer } from 'ws';
 import { randomUUID, randomBytes, timingSafeEqual } from 'node:crypto';
 import { Sessions } from './sessions.mjs';
@@ -11,8 +12,9 @@ const same = (a, b) => {
   const left = Buffer.from(a), right = Buffer.from(b);
   return left.length === right.length && timingSafeEqual(left, right);
 };
-export async function startBroker({ token = randomUUID(), timeout, draftRoot, saveWait, editorWait, editorHtml } = {}) {
+export async function startBroker({ token = randomUUID(), timeout, draftRoot, saveWait, editorWait, editorHtml, documentRoot, listenPort = 0 } = {}) {
   const sessions = new Sessions({ timeout, draftRoot, saveWait, editorWait, onActivity: id => broadcast(id) }), views = new Map();
+  const documents = documentRoot ?? path.join(path.dirname(sessions.draftRoot), 'documents');
   let port;
   const viewUrl = id => `http://127.0.0.1:${port}/view/${id}/${views.get(id)}`;
   // The local view replaces the MCP App panel in hosts that do not render MCP Apps (Claude Code).
@@ -43,8 +45,18 @@ export async function startBroker({ token = randomUUID(), timeout, draftRoot, sa
       // The service owns the deadlines; clients use the budget it advertises, not their own environment.
       if (method === 'ping') result = { version: VERSION, editorWait: sessions.editorWait, rpcTimeoutMs: sessions.rpcBudget };
       else if (method === 'open' || method === 'new') {
-        const filename = method === 'new' ? await createDocument(args.path) : args.path;
-        result = await sessions.open(filename, args.scope);
+        let destination = args.path;
+        if (method === 'new' && destination === undefined) {
+          await mkdir(documents, { recursive: true, mode: 0o700 });
+          destination = path.join(documents, `${randomUUID()}.pen`);
+        }
+        const filename = method === 'new' ? await createDocument(destination) : destination;
+        const file = await realpath(filename);
+        let managedDirectory;
+        try { managedDirectory = await realpath(documents); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+        // Managed drafts belong to the document across conversations; live scope exclusivity is unchanged.
+        const draftScope = path.dirname(file) === managedDirectory ? 'managed-document' : args.scope;
+        result = await sessions.open(file, args.scope, { draftScope });
         if (!views.has(result.sessionId)) views.set(result.sessionId, randomUUID());
         result = { ...result, editorToken: views.get(result.sessionId), viewUrl: viewUrl(result.sessionId) };
       } else if (method === 'schema') result = await sessions.schema(args.sessionId);
@@ -56,6 +68,14 @@ export async function startBroker({ token = randomUUID(), timeout, draftRoot, sa
       else if (method === 'export') result = await sessions.exportNodes(args.sessionId, args.lease, args.nodeIds, args.format, args.directory);
       else if (method === 'save') result = await sessions.save(args.sessionId, args.lease);
       else if (method === 'save-as') result = await sessions.saveAs(args.sessionId, args.lease, args.path);
+      else if (method === 'documents') {
+        let entries = [];
+        try { entries = await readdir(documents, { withFileTypes: true }); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+        result = { directory: documents, documents: await Promise.all(entries.filter(e => e.isFile() && e.name.endsWith('.pen')).map(async e => {
+          const filename = path.join(documents, e.name), info = await stat(filename);
+          return { path: filename, name: e.name, updatedAt: info.mtime.toISOString() };
+        })), sessions: [...sessions.items.values()].map(s => ({ path: s.file, ...sessions.status(s.id) })) };
+      }
       else throw new Error('Unknown broker method');
       res.end(JSON.stringify({ result }));
     } catch (e) { res.end(JSON.stringify({ error: { code: e.code ?? 'BROKER_ERROR', message: e.message } })); }
@@ -81,6 +101,7 @@ export async function startBroker({ token = randomUUID(), timeout, draftRoot, sa
           const message = JSON.parse(bytes.toString());
           if (message.kind === 'ready') sessions.ready(id, generation);
           else if (message.kind === 'response') sessions.reply(id, generation, message);
+          else if (message.kind === 'notification') sessions.notification(id, generation, message.method, message.payload);
           else if (message.kind === 'storage') {
             // Registered synchronously, in channel order: the sessions layer persists them one by one.
             sessions.storage(id, generation, message.method, message.payload).then(
@@ -93,7 +114,7 @@ export async function startBroker({ token = randomUUID(), timeout, draftRoot, sa
       peer.on('close', () => sessions.detach(id, generation));
     });
   });
-  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(listenPort, '127.0.0.1', resolve); });
   port = server.address().port;
   return { port, token, sessions, close: async () => {
     for (const peer of ws.clients) peer.terminate();

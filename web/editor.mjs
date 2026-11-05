@@ -11,6 +11,7 @@ function connectEditor() {
   const channel = new MessageChannel(); port = channel.port1;
   port.onmessage = event => {
     const m = event.data;
+    if (!m || typeof m !== 'object') return;
     if (m.kind === 'ready') { socket.send(JSON.stringify({ kind: 'ready' })); connected = true; clearInterval(timer); show('Channel connected · loading the engine'); window.pencilPanelState = 'bridge-ready'; return; }
     if (m.kind === 'error') { show(`Pencil: ${m.message}`); return; }
     if (m.kind === 'request') {
@@ -18,6 +19,7 @@ function connectEditor() {
       if (payload?.data instanceof Uint8Array) payload.data = [...payload.data];
       socket.send(JSON.stringify({ ...m, kind: 'storage' }));
     } else if (m.kind === 'response') socket.send(JSON.stringify(m));
+    else if (m.kind === 'notification' && m.method === 'selection-changed') socket.send(JSON.stringify({ kind: 'notification', method: m.method, payload: m.payload }));
   };
   port.start();
   frame.contentWindow.postMessage({ type: 'pen:connect', theme: 'dark', fileURI: config.fileURI }, 'https://app.pen.dev', [channel.port2]);

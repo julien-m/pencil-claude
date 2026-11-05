@@ -1,7 +1,7 @@
 {
   "name": "pencil",
   "displayName": "Pencil",
-  "version": "0.5.0",
+  "version": "0.6.1",
   "description": "Open .pen designs in the real Pencil editor through a local view, with one channel per design session and reservations so several agents can share it.",
   "author": {
     "name": "Julien M"
@@ -9,5 +9,11 @@
   "homepage": "https://github.com/julien-m/pencil-claude",
   "repository": "https://github.com/julien-m/pencil-claude",
   "license": "MIT",
-  "keywords": ["pencil", "pen", "design", "multi-agent", "mcp"]
+  "keywords": [
+    "pencil",
+    "pen",
+    "design",
+    "multi-agent",
+    "mcp"
+  ]
 }

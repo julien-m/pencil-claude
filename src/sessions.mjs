@@ -19,7 +19,7 @@ export class Sessions {
   get rpcBudget() { return this.editorWait + 2 * this.timeout + this.saveWait + 2000; }
   get(id) { return this.items.get(id) ?? fail('SESSION_NOT_FOUND', 'Unknown session'); }
   // Exclusivity is between design sessions: a document belongs to exactly one session.
-  async open(filename, scope) {
+  async open(filename, scope, { draftScope = scope } = {}) {
     if (!path.isAbsolute(filename) || path.extname(filename).toLowerCase() !== '.pen') fail('INVALID_PATH', 'An absolute .pen file path is required');
     const file = await fs.realpath(filename);
     if (path.extname(file).toLowerCase() !== '.pen') fail('INVALID_PATH', 'The resolved target must be a .pen document');
@@ -31,7 +31,7 @@ export class Sessions {
       return this.status(previous.id);
     }
     const id = randomUUID();
-    const draft = path.join(this.draftRoot, `${digest(`${scope}:${file}`)}.pen`);
+    const draft = path.join(this.draftRoot, `${digest(`${draftScope}:${file}`)}.pen`);
     const s = {
       id, scope, file, draft, exportJobs: new Map(), virtualRoot: `pencil/${id}/`, generation: 0, pending: new Map(),
       participants: new Map(), flights: new Set(), saving: null, persistTail: Promise.resolve(), coverageWaiters: new Set(), recent: [],
@@ -40,6 +40,7 @@ export class Sessions {
       mutations: 0, savedThrough: 0,
       blocked: false, connected: false, savedHash: null, operations: 0, recoveries: 0, saveState: 'not-loaded'
     };
+    s.selection = { available: false, nodes: [], updatedAt: null };
     this.items.set(id, s);
     return this.status(id);
   }
@@ -49,6 +50,7 @@ export class Sessions {
     return {
       sessionId: s.id, scope: s.scope, name: path.basename(s.file), connected: s.connected, editorReady: s.editorReady, openedAt: s.openedAt, readyAt: s.readyAt,
       metadataStats: { ...s.metadataStats }, generation: s.generation, blocked: s.blocked,
+      selection: structuredClone(s.selection),
       agents, activeCalls: s.flights.size, saving: !!s.saving, operations: s.operations, recoveries: s.recoveries,
       saveState: s.saveState, unsavedMutations: Math.max(0, s.mutations - s.savedThrough), draftPath: s.draft, recentCalls: s.recent.slice(-20)
     };
@@ -61,6 +63,7 @@ export class Sessions {
     // unsaved engine state died with the previous view. Agents must re-read before editing.
     if (s.blocked) { s.blocked = false; s.recoveries += 1; }
     s.generation += 1; s.send = send; s.connected = true; s.editorReady = false; s.readyAt = null;
+    s.selection = { available: false, nodes: [], updatedAt: null };
     s.metadata.clear(); s.metadataStats = { requests: 0, hits: 0 };
     if (ready) this.ready(id, s.generation);
     return { generation: s.generation, fileURI: `file:///${s.virtualRoot}${encodeURIComponent(path.basename(s.file))}` };
@@ -77,6 +80,7 @@ export class Sessions {
     const s = this.get(id);
     if (generation !== s.generation) return;
     s.connected = false; s.editorReady = false; s.send = undefined; s.metadata.clear();
+    s.selection = { available: false, nodes: [], updatedAt: null };
     for (const p of s.pending.values()) p.reject(new SessionError('OUTCOME_UNKNOWN', 'Connection lost during a call'));
     if (s.pending.size) s.blocked = true;
     s.pending.clear();
@@ -148,6 +152,7 @@ export class Sessions {
     const s = this.get(id);
     this.participant(s, token);
     if (!['execute', 'read_skill', 'get_style', 'get_app_state'].includes(name)) fail('TOOL_NOT_ALLOWED', 'Tool not exposed by this plugin');
+    if (name === 'execute') args = { ...args, uri: `file:///${s.virtualRoot}${encodeURIComponent(path.basename(s.file))}` };
     // Generation and execution are mixed in execute; async generation is excluded from this version.
     if (name === 'execute' && /\bGenerate\s*\(/.test(args.input ?? '')) fail('ASYNC_UNSUPPORTED', 'Asynchronous generation is not supported in this version');
     const queuedAt = new Date().toISOString();
@@ -217,6 +222,16 @@ export class Sessions {
     s.pending.delete(message.id);
     if (message.error) p.reject(new SessionError('EDITOR_ERROR', String(message.error.message)));
     else p.resolve(message.payload);
+    return true;
+  }
+  notification(id, generation, method, payload) {
+    const s = this.get(id);
+    if (!s.connected || generation !== s.generation || method !== 'selection-changed') return false;
+    if (!Array.isArray(payload?.nodes) || payload.nodes.length > 1000) return false;
+    const nodes = payload.nodes;
+    if (nodes.some(n => !n || typeof n.id !== 'string' || n.id.length > 1000 || typeof n.type !== 'string' || n.type.length > 100 || (n.name !== undefined && (typeof n.name !== 'string' || n.name.length > 10000)))) return false;
+    s.selection = { available: true, nodes: nodes.map(({ id, type, name }) => ({ id, type, ...(name === undefined ? {} : { name }) })), updatedAt: new Date().toISOString() };
+    this.onActivity(id);
     return true;
   }
   async capture(id, token, nodeIds, directory) {

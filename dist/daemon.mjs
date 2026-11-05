@@ -3720,7 +3720,8 @@ var require_websocket_server = __commonJS({
 
 // src/broker.mjs
 import http from "node:http";
-import { readFile as readFile2 } from "node:fs/promises";
+import { readFile as readFile2, mkdir as mkdir3, readdir, stat as stat3, realpath as realpath3 } from "node:fs/promises";
+import path3 from "node:path";
 
 // node_modules/ws/wrapper.mjs
 var import_stream = __toESM(require_stream(), 1);
@@ -3827,19 +3828,19 @@ var Sessions = class {
     return this.items.get(id) ?? fail("SESSION_NOT_FOUND", "Unknown session");
   }
   // Exclusivity is between design sessions: a document belongs to exactly one session.
-  async open(filename, scope) {
+  async open(filename, scope, { draftScope = scope } = {}) {
     if (!path2.isAbsolute(filename) || path2.extname(filename).toLowerCase() !== ".pen") fail("INVALID_PATH", "An absolute .pen file path is required");
     const file = await fs2.realpath(filename);
     if (path2.extname(file).toLowerCase() !== ".pen") fail("INVALID_PATH", "The resolved target must be a .pen document");
-    const stat3 = await fs2.stat(file);
-    if (!stat3.isFile() || stat3.size > 32 * 1024 * 1024) fail("INVALID_FILE", "Invalid or oversized document");
+    const stat4 = await fs2.stat(file);
+    if (!stat4.isFile() || stat4.size > 32 * 1024 * 1024) fail("INVALID_FILE", "Invalid or oversized document");
     const previous = [...this.items.values()].find((s2) => s2.file === file);
     if (previous) {
       if (previous.scope !== scope) fail("DOCUMENT_BUSY", "This document already belongs to another design session; create a copy for a variant");
       return this.status(previous.id);
     }
     const id = randomUUID();
-    const draft = path2.join(this.draftRoot, `${digest(`${scope}:${file}`)}.pen`);
+    const draft = path2.join(this.draftRoot, `${digest(`${draftScope}:${file}`)}.pen`);
     const s = {
       id,
       scope,
@@ -3871,6 +3872,7 @@ var Sessions = class {
       recoveries: 0,
       saveState: "not-loaded"
     };
+    s.selection = { available: false, nodes: [], updatedAt: null };
     this.items.set(id, s);
     return this.status(id);
   }
@@ -3888,6 +3890,7 @@ var Sessions = class {
       metadataStats: { ...s.metadataStats },
       generation: s.generation,
       blocked: s.blocked,
+      selection: structuredClone(s.selection),
       agents,
       activeCalls: s.flights.size,
       saving: !!s.saving,
@@ -3912,6 +3915,7 @@ var Sessions = class {
     s.connected = true;
     s.editorReady = false;
     s.readyAt = null;
+    s.selection = { available: false, nodes: [], updatedAt: null };
     s.metadata.clear();
     s.metadataStats = { requests: 0, hits: 0 };
     if (ready) this.ready(id, s.generation);
@@ -3933,6 +3937,7 @@ var Sessions = class {
     s.editorReady = false;
     s.send = void 0;
     s.metadata.clear();
+    s.selection = { available: false, nodes: [], updatedAt: null };
     for (const p of s.pending.values()) p.reject(new SessionError("OUTCOME_UNKNOWN", "Connection lost during a call"));
     if (s.pending.size) s.blocked = true;
     s.pending.clear();
@@ -4023,6 +4028,7 @@ var Sessions = class {
     const s = this.get(id);
     this.participant(s, token);
     if (!["execute", "read_skill", "get_style", "get_app_state"].includes(name)) fail("TOOL_NOT_ALLOWED", "Tool not exposed by this plugin");
+    if (name === "execute") args = { ...args, uri: `file:///${s.virtualRoot}${encodeURIComponent(path2.basename(s.file))}` };
     if (name === "execute" && /\bGenerate\s*\(/.test(args.input ?? "")) fail("ASYNC_UNSUPPORTED", "Asynchronous generation is not supported in this version");
     const queuedAt = (/* @__PURE__ */ new Date()).toISOString();
     const waiting = this.participant(s, token);
@@ -4133,6 +4139,16 @@ var Sessions = class {
     s.pending.delete(message.id);
     if (message.error) p.reject(new SessionError("EDITOR_ERROR", String(message.error.message)));
     else p.resolve(message.payload);
+    return true;
+  }
+  notification(id, generation, method, payload) {
+    const s = this.get(id);
+    if (!s.connected || generation !== s.generation || method !== "selection-changed") return false;
+    if (!Array.isArray(payload?.nodes) || payload.nodes.length > 1e3) return false;
+    const nodes = payload.nodes;
+    if (nodes.some((n) => !n || typeof n.id !== "string" || n.id.length > 1e3 || typeof n.type !== "string" || n.type.length > 100 || n.name !== void 0 && (typeof n.name !== "string" || n.name.length > 1e4))) return false;
+    s.selection = { available: true, nodes: nodes.map(({ id: id2, type, name }) => ({ id: id2, type, ...name === void 0 ? {} : { name } })), updatedAt: (/* @__PURE__ */ new Date()).toISOString() };
+    this.onActivity(id);
     return true;
   }
   async capture(id, token, nodeIds, directory2) {
@@ -4387,7 +4403,7 @@ var Sessions = class {
 };
 
 // src/version.mjs
-var VERSION = "0.5.0";
+var VERSION = "0.6.1";
 
 // src/broker.mjs
 var same = (a, b) => {
@@ -4395,8 +4411,9 @@ var same = (a, b) => {
   const left = Buffer.from(a), right = Buffer.from(b);
   return left.length === right.length && timingSafeEqual(left, right);
 };
-async function startBroker({ token = randomUUID2(), timeout, draftRoot, saveWait, editorWait, editorHtml } = {}) {
+async function startBroker({ token = randomUUID2(), timeout, draftRoot, saveWait, editorWait, editorHtml, documentRoot, listenPort = 0 } = {}) {
   const sessions = new Sessions({ timeout, draftRoot, saveWait, editorWait, onActivity: (id) => broadcast(id) }), views = /* @__PURE__ */ new Map();
+  const documents = documentRoot ?? path3.join(path3.dirname(sessions.draftRoot), "documents");
   let port;
   const viewUrl = (id) => `http://127.0.0.1:${port}/view/${id}/${views.get(id)}`;
   async function serveView(req, res) {
@@ -4442,8 +4459,21 @@ async function startBroker({ token = randomUUID2(), timeout, draftRoot, saveWait
       let result;
       if (method === "ping") result = { version: VERSION, editorWait: sessions.editorWait, rpcTimeoutMs: sessions.rpcBudget };
       else if (method === "open" || method === "new") {
-        const filename = method === "new" ? await createDocument(args.path) : args.path;
-        result = await sessions.open(filename, args.scope);
+        let destination = args.path;
+        if (method === "new" && destination === void 0) {
+          await mkdir3(documents, { recursive: true, mode: 448 });
+          destination = path3.join(documents, `${randomUUID2()}.pen`);
+        }
+        const filename = method === "new" ? await createDocument(destination) : destination;
+        const file = await realpath3(filename);
+        let managedDirectory;
+        try {
+          managedDirectory = await realpath3(documents);
+        } catch (error) {
+          if (error.code !== "ENOENT") throw error;
+        }
+        const draftScope = path3.dirname(file) === managedDirectory ? "managed-document" : args.scope;
+        result = await sessions.open(file, args.scope, { draftScope });
         if (!views.has(result.sessionId)) views.set(result.sessionId, randomUUID2());
         result = { ...result, editorToken: views.get(result.sessionId), viewUrl: viewUrl(result.sessionId) };
       } else if (method === "schema") result = await sessions.schema(args.sessionId);
@@ -4455,7 +4485,18 @@ async function startBroker({ token = randomUUID2(), timeout, draftRoot, saveWait
       else if (method === "export") result = await sessions.exportNodes(args.sessionId, args.lease, args.nodeIds, args.format, args.directory);
       else if (method === "save") result = await sessions.save(args.sessionId, args.lease);
       else if (method === "save-as") result = await sessions.saveAs(args.sessionId, args.lease, args.path);
-      else throw new Error("Unknown broker method");
+      else if (method === "documents") {
+        let entries = [];
+        try {
+          entries = await readdir(documents, { withFileTypes: true });
+        } catch (e) {
+          if (e.code !== "ENOENT") throw e;
+        }
+        result = { directory: documents, documents: await Promise.all(entries.filter((e) => e.isFile() && e.name.endsWith(".pen")).map(async (e) => {
+          const filename = path3.join(documents, e.name), info = await stat3(filename);
+          return { path: filename, name: e.name, updatedAt: info.mtime.toISOString() };
+        })), sessions: [...sessions.items.values()].map((s) => ({ path: s.file, ...sessions.status(s.id) })) };
+      } else throw new Error("Unknown broker method");
       res.end(JSON.stringify({ result }));
     } catch (e) {
       res.end(JSON.stringify({ error: { code: e.code ?? "BROKER_ERROR", message: e.message } }));
@@ -4496,6 +4537,7 @@ async function startBroker({ token = randomUUID2(), timeout, draftRoot, saveWait
           const message = JSON.parse(bytes.toString());
           if (message.kind === "ready") sessions.ready(id, generation);
           else if (message.kind === "response") sessions.reply(id, generation, message);
+          else if (message.kind === "notification") sessions.notification(id, generation, message.method, message.payload);
           else if (message.kind === "storage") {
             sessions.storage(id, generation, message.method, message.payload).then(
               (payload) => {
@@ -4518,7 +4560,7 @@ async function startBroker({ token = randomUUID2(), timeout, draftRoot, saveWait
   });
   await new Promise((resolve, reject) => {
     server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
+    server.listen(listenPort, "127.0.0.1", resolve);
   });
   port = server.address().port;
   return { port, token, sessions, close: async () => {
@@ -4535,12 +4577,12 @@ var root = fileURLToPath(new URL("../", import.meta.url));
 
 // src/daemon.mjs
 import * as fs3 from "node:fs/promises";
-import path3 from "node:path";
+import path4 from "node:path";
 var directory = process.argv[2];
-var broker = await startBroker({ draftRoot: path3.join(directory, "drafts"), editorWait: editorWaitFromEnv(), editorHtml: path3.join(root, "dist/editor.html") });
-await fs3.writeFile(path3.join(directory, "connection.json"), JSON.stringify({ port: broker.port, token: broker.token, pid: process.pid }), { mode: 384 });
+var broker = await startBroker({ draftRoot: path4.join(directory, "drafts"), editorWait: editorWaitFromEnv(), editorHtml: path4.join(root, "dist/editor.html") });
+await fs3.writeFile(path4.join(directory, "connection.json"), JSON.stringify({ port: broker.port, token: broker.token, pid: process.pid }), { mode: 384 });
 async function shutdown() {
-  await fs3.unlink(path3.join(directory, "connection.json")).catch(() => {
+  await fs3.unlink(path4.join(directory, "connection.json")).catch(() => {
   });
   await broker.close();
   process.exit(0);
