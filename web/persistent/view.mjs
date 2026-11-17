@@ -71,7 +71,7 @@ saveButton.addEventListener('click', () => send({ kind: 'save' }));
 async function boot() {
   if (window.pencilRemoteApp) {
     const [{ App }, { createMcpTransport }] = await Promise.all([import('@modelcontextprotocol/ext-apps'), import('../mcp-transport.mjs')]);
-    const app = new App({ name: 'Pencil', version: '0.7.0' }, { availableDisplayModes: ['fullscreen'] });
+    const app = new App({ name: 'Pencil', version: '0.7.1' }, { availableDisplayModes: ['fullscreen'] });
     const showEditor = async editor => {
       if (tearingDown || (socket && socket.readyState !== 3 && currentEditor?.sessionId === editor.sessionId && currentEditor?.editorToken === editor.editorToken)) return;
       // Close the previous channel before replacement; ignore its late frames/errors.

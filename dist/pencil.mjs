@@ -40284,7 +40284,7 @@ import path from "node:path";
 import { randomUUID as randomUUID3 } from "node:crypto";
 
 // src/version.mjs
-var VERSION = "0.7.0";
+var VERSION = "0.7.1";
 
 // src/persistent/mcp.mjs
 import { readFile } from "node:fs/promises";

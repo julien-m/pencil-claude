@@ -1,6 +1,6 @@
 # Pencil for Claude Code
 
-Pencil opens and edits opaque `.pen` documents using the real hosted editor at `https://app.pen.dev`. Version **0.7.0** makes the persistent renderer the default under the existing **Pencil** plugin identity (`pencil@pencil`). The previous implementation remains on Git branch `archive/pre-persistent-pencil-2026-11-17`.
+Pencil opens and edits opaque `.pen` documents using the real hosted editor at `https://app.pen.dev`. Version **0.7.1** makes the persistent renderer the default under the existing **Pencil** plugin identity (`pencil@pencil`). The previous implementation remains on Git branch `archive/pre-persistent-pencil-2026-11-17`.
 
 The [Codex plugin](https://github.com/julien-m/pencil-codex) is maintained in its separate repository. This Claude plugin retains its selection context, read-only calls, persistent local document catalog, coordinated saves and per-conversation default scope.
 

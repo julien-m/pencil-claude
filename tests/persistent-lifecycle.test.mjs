@@ -76,3 +76,27 @@ test('broker retains the persistent managed document catalog with lifecycle inje
     assert.equal((await fs.stat(catalog.documents[0].path)).isFile(), true);
   } finally { await broker.close(); await fs.rm(directory, { recursive: true, force: true }); }
 });
+
+test('unchanged Save and completion create baseline storage before the first autosave', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'pencil-first-save-'));
+  try {
+    for (const operation of ['save', 'close']) {
+      const file = path.join(directory, `${operation}.pen`), bytes = randomUUID();
+      const draftRoot = path.join(directory, operation, 'drafts');
+      await fs.writeFile(file, bytes);
+      const sessions = new Sessions({ draftRoot });
+      const { sessionId } = await sessions.open(file, operation), engine = attachEngine(sessions, sessionId);
+      await sessions.storage(sessionId, engine.generation, 'storage-load');
+      await assert.rejects(fs.access(draftRoot), { code: 'ENOENT' });
+      const { lease } = sessions.acquire(sessionId, 'owner');
+      if (operation === 'save') assert.equal((await sessions.save(sessionId, lease)).path, await fs.realpath(file));
+      else {
+        const closed = await sessions.finish(sessionId, lease, { prepare: async () => {}, resume: async () => {}, dispose: async () => {} });
+        assert.equal(closed.rendererReleased, true);
+        assert.throws(() => sessions.status(sessionId), { code: 'SESSION_NOT_FOUND' });
+      }
+      assert.equal(await fs.readFile(file, 'utf8'), bytes);
+      assert((await fs.readdir(draftRoot)).some(name => name.endsWith('.baseline')));
+    }
+  } finally { await fs.rm(directory, { recursive: true, force: true }); }
+});

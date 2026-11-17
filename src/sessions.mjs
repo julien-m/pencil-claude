@@ -372,7 +372,11 @@ export class Sessions {
     s.persistTail = result.then(() => {}, () => {});
     return result;
   }
-  writeBaseline(s) { return this.atomicWrite(`${s.draft}.baseline`, Buffer.from(JSON.stringify({ sourceHash: s.savedHash }))); }
+  async writeBaseline(s) {
+    // An unchanged loaded document may be saved before its first draft/autosave.
+    await fs.mkdir(this.draftRoot, { recursive: true, mode: 0o700 });
+    return this.atomicWrite(`${s.draft}.baseline`, Buffer.from(JSON.stringify({ sourceHash: s.savedHash })));
+  }
   // Storage requests are registered synchronously in arrival order, so a snapshot only covers
   // the mutations whose responses reached the service before it.
   storage(id, generation, method, payload) {

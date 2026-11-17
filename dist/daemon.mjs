@@ -4340,7 +4340,8 @@ var Sessions = class {
     });
     return result;
   }
-  writeBaseline(s) {
+  async writeBaseline(s) {
+    await fs2.mkdir(this.draftRoot, { recursive: true, mode: 448 });
     return this.atomicWrite(`${s.draft}.baseline`, Buffer.from(JSON.stringify({ sourceHash: s.savedHash })));
   }
   // Storage requests are registered synchronously in arrival order, so a snapshot only covers
@@ -4454,7 +4455,7 @@ var Sessions = class {
 };
 
 // src/version.mjs
-var VERSION = "0.7.0";
+var VERSION = "0.7.1";
 
 // src/broker.mjs
 var same = (a, b) => {
