@@ -1,0 +1,7 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Pencil</title>
+<style>
+:root{color-scheme:dark}html,body{margin:0;height:100%;font:14px system-ui;background:#18181b;color:#fafafa}body{display:flex;flex-direction:column}header{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:8px 12px;flex-wrap:wrap}header div{display:flex;align-items:center;gap:12px}main{display:flex;align-items:center;justify-content:center;flex:1;min-height:0}img{display:block;width:100%;height:100%;object-fit:contain;touch-action:none;user-select:none;-webkit-user-select:none}img:focus-visible{outline:2px solid #7dd3fc;outline-offset:-2px}button{font:inherit;padding:8px 16px;border:1px solid #71717a;border-radius:4px;background:#27272a;color:inherit}button:focus-visible{outline:2px solid #7dd3fc}
+</style>
+<header><div><strong>Pencil</strong><span role="status" data-testid="remote-view-status" aria-live="polite">Connecting…</span></div><button type="button" data-testid="remote-save-document" disabled>Save document</button></header>
+<main aria-label="Remote editor"><img tabindex="0" data-testid="remote-editor-image" alt="Live Pencil editor. Click to focus, then use the pointer or keyboard. Screen-reader access to the remote editor is not available."></main>
+<script type="module" src="/view.mjs"></script></html>

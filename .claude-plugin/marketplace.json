@@ -9,8 +9,8 @@
   "plugins": [
     {
       "name": "pencil",
-      "description": "Open .pen designs in the real Pencil editor through a local view, with one channel per design session and multi-agent reservations.",
-      "version": "0.6.1",
+      "description": "Persistent Pencil editor with background work, local drafts and explicit session completion.",
+      "version": "0.7.0",
       "source": "./",
       "category": "design"
     }

@@ -2,7 +2,9 @@
   "mcpServers": {
     "pencil": {
       "command": "node",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/dist/server.mjs"]
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/dist/pencil.mjs"
+      ]
     }
   }
 }

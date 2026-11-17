@@ -7,6 +7,17 @@ const js = result.outputFiles[0].text.replace(/<\/script/gi, '<\\/script');
 await mkdir('dist', { recursive: true });
 for (const name of ['server', 'daemon']) builds.push(await build({ entryPoints: [`src/${name}.mjs`], outfile: `dist/${name}.mjs`, bundle: true, format: 'esm', platform: 'node', target: 'node22', metafile: true, banner: { js: 'import { createRequire as createPluginRequire } from "node:module"; const require = createPluginRequire(import.meta.url);' } }));
 await writeFile('dist/editor.html', `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Pencil</title><style>html,body{margin:0;height:100%;background:#161616;color:#ddd;font:13px system-ui}body{display:flex;flex-direction:column}header{padding:8px 12px;min-height:18px;border-bottom:1px solid #333}#activity{color:#8edab1}iframe{flex:1;border:0;width:100%;background:#161616}</style><header id="status" role="status">Opening Pencil…</header><header id="activity" aria-live="polite">No agent on this document</header><iframe title="Pencil editor" allow="clipboard-read; clipboard-write"></iframe><script>${js}</script></html>`);
+// Canonical Pencil clients use a separately supervised persistent renderer service.
+await mkdir('dist/persistent', { recursive: true });
+const persistentView = await build({ entryPoints: ['web/persistent/view.mjs'], bundle: true, format: 'iife', platform: 'browser', write: false, minify: true, metafile: true });
+builds.push(persistentView);
+const viewTemplate = await readFile('web/persistent/view.html', 'utf8');
+const viewCode = persistentView.outputFiles[0].text.replace(/<\/script/gi, '<\\/script');
+await writeFile('dist/persistent/view.mjs', persistentView.outputFiles[0].text);
+await writeFile('dist/persistent/view.html', viewTemplate);
+await writeFile('dist/persistent/view-app.html', viewTemplate.replace('<script type="module" src="/view.mjs"></script>', () => `<script>window.pencilRemoteApp=true;${viewCode}</script>`));
+for (const name of ['engine.html', 'engine.mjs', 'point.mjs', 'keyboard.mjs', 'view-messages.mjs']) await writeFile(`dist/persistent/${name}`, await readFile(`web/persistent/${name}`));
+for (const [entry, output] of [['mcp', 'pencil'], ['server', 'persistent-service']]) builds.push(await build({ entryPoints: [`src/persistent/${entry}.mjs`], outfile: `dist/${output}.mjs`, bundle: true, format: 'esm', platform: 'node', target: 'node22', external: ['playwright-core'], metafile: true, banner: { js: 'import { createRequire as createPluginRequire } from "node:module"; const require = createPluginRequire(import.meta.url);' } }));
 // Preserve the licenses of the packages actually included in the bundles.
 const packages = new Map();
 for (const bundle of builds) for (const input of Object.keys(bundle.metafile.inputs)) {

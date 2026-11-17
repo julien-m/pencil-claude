@@ -10,5 +10,5 @@ test('plugin, marketplace, package and runtime versions agree', async () => {
 });
 test('the MCP server runs from the installed plugin root only', async () => {
   const { mcpServers } = await json('.mcp.json');
-  expect(mcpServers.pencil.args).toEqual(['${CLAUDE_PLUGIN_ROOT}/dist/server.mjs']);
+  expect(mcpServers.pencil.args).toEqual(['${CLAUDE_PLUGIN_ROOT}/dist/pencil.mjs']);
 });

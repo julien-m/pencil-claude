@@ -19,7 +19,7 @@ export class Sessions {
   get rpcBudget() { return this.editorWait + 2 * this.timeout + this.saveWait + 2000; }
   get(id) { return this.items.get(id) ?? fail('SESSION_NOT_FOUND', 'Unknown session'); }
   // Exclusivity is between design sessions: a document belongs to exactly one session.
-  async open(filename, scope, { draftScope = scope } = {}) {
+  async open(filename, scope, { draftScope = scope, explicit = false } = {}) {
     if (!path.isAbsolute(filename) || path.extname(filename).toLowerCase() !== '.pen') fail('INVALID_PATH', 'An absolute .pen file path is required');
     const file = await fs.realpath(filename);
     if (path.extname(file).toLowerCase() !== '.pen') fail('INVALID_PATH', 'The resolved target must be a .pen document');
@@ -27,11 +27,24 @@ export class Sessions {
     if (!stat.isFile() || stat.size > 32 * 1024 * 1024) fail('INVALID_FILE', 'Invalid or oversized document');
     const previous = [...this.items.values()].find(s => s.file === file);
     if (previous) {
+      if (previous.closing) fail('SESSION_CLOSING', 'Session is closing');
       if (previous.scope !== scope) fail('DOCUMENT_BUSY', 'This document already belongs to another design session; create a copy for a variant');
       return this.status(previous.id);
     }
     const id = randomUUID();
     const draft = path.join(this.draftRoot, `${digest(`${draftScope}:${file}`)}.pen`);
+    try {
+      await fs.access(`${draft}.closed`);
+      if (!explicit) fail('SESSION_CLOSED', 'Explicitly reopen the document after completing its session');
+      await fs.unlink(`${draft}.closed`);
+    } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    // Filesystem checks may overlap another opener: claim only one writer slot.
+    const concurrent = [...this.items.values()].find(session => session.file === file);
+    if (concurrent) {
+      if (concurrent.closing) fail('SESSION_CLOSING', 'Session is closing');
+      if (concurrent.scope !== scope) fail('DOCUMENT_BUSY', 'Document belongs to another design session');
+      return this.status(concurrent.id);
+    }
     const s = {
       id, scope, file, draft, exportJobs: new Map(), virtualRoot: `pencil/${id}/`, generation: 0, pending: new Map(),
       participants: new Map(), flights: new Set(), saving: null, persistTail: Promise.resolve(), coverageWaiters: new Set(), recent: [],
@@ -57,7 +70,7 @@ export class Sessions {
   }
   // ready: false when the engine must still confirm it is loaded (the real view sends "ready").
   attach(id, send, { ready = true } = {}) {
-    const s = this.get(id);
+    const s = this.get(id); this.available(s);
     if (s.connected) fail('EDITOR_ALREADY_CONNECTED', 'An editor view is already attached to this session');
     // A new view reloads the last acknowledged draft, which settles any unknown outcome:
     // unsaved engine state died with the previous view. Agents must re-read before editing.
@@ -77,8 +90,8 @@ export class Sessions {
     return true;
   }
   detach(id, generation) {
-    const s = this.get(id);
-    if (generation !== s.generation) return;
+    const s = this.items.get(id);
+    if (!s || generation !== s.generation) return;
     s.connected = false; s.editorReady = false; s.send = undefined; s.metadata.clear();
     s.selection = { available: false, nodes: [], updatedAt: null };
     for (const p of s.pending.values()) p.reject(new SessionError('OUTCOME_UNKNOWN', 'Connection lost during a call'));
@@ -123,14 +136,14 @@ export class Sessions {
     return { hit, value: structuredClone(await entry) };
   }
   async schema(id) {
-    const s = this.get(id);
+    const s = this.get(id); this.available(s);
     await this.dispatchable(s, Date.now() + this.editorWait);
     return (await this.cached(s, 'schema', () => this.request(id, 'get-mcp-schema'))).value;
   }
   // Inside a session every agent gets its own non-exclusive participation token (the "lease"
   // field): there is no lock between agents, and one agent leaving never interrupts the others.
   acquire(id, agent) {
-    const s = this.get(id);
+    const s = this.get(id); this.available(s);
     if (s.blocked) fail('OUTCOME_UNKNOWN', 'Session blocked after an unknown outcome');
     const lease = randomUUID();
     s.participants.set(lease, { agent, activeCalls: 0, waitingCalls: 0 });
@@ -138,6 +151,7 @@ export class Sessions {
     return { lease, ...this.status(id) };
   }
   release(id, token) {
+    this.available(this.get(id));
     const s = this.get(id), participant = this.participant(s, token);
     if (participant.activeCalls || participant.waitingCalls) fail('CALLS_IN_FLIGHT', 'This agent still has calls in progress');
     s.participants.delete(token);
@@ -149,7 +163,7 @@ export class Sessions {
   // own correlation id, so responses may come back in any order. Only a save in progress holds
   // new calls back, briefly, until its flush and write are done.
   async call(id, token, name, args = {}, { observational = false } = {}) {
-    const s = this.get(id);
+    const s = this.get(id); this.available(s);
     this.participant(s, token);
     if (!['execute', 'read_skill', 'get_style', 'get_app_state'].includes(name)) fail('TOOL_NOT_ALLOWED', 'Tool not exposed by this plugin');
     if (name === 'execute') args = { ...args, uri: `file:///${s.virtualRoot}${encodeURIComponent(path.basename(s.file))}` };
@@ -263,8 +277,8 @@ export class Sessions {
   // Save and Save As: wait for the calls in flight, hold new calls back, ask the engine to flush
   // (or wait for its autosave), check that the persisted snapshot covers every completed
   // mutation, then write. Agents stay joined throughout.
-  async consistent(id, token, write) {
-    const s = this.get(id); this.participant(s, token);
+  async consistent(id, token, write, { forClose = false } = {}) {
+    const s = this.get(id); if (!forClose) this.available(s); this.participant(s, token);
     while (s.saving) await s.saving;
     let open; s.saving = new Promise(resolve => { open = resolve; }); this.onActivity(id);
     try {
@@ -308,7 +322,7 @@ export class Sessions {
   }
   // Replace the original only if nobody changed it since the engine loaded it. The previous
   // version is kept in backups/ first; a final hash check runs right before the atomic rename.
-  save(id, token) {
+  save(id, token, options) {
     return this.consistent(id, token, async s => {
       const unchanged = async () => s.savedHash !== null && digest(await fs.readFile(s.file)) === s.savedHash;
       const conflict = () => { s.saveState = 'conflict'; fail('SAVE_CONFLICT', 'The original file changed since it was loaded; nothing was replaced. Use Save As'); };
@@ -326,8 +340,32 @@ export class Sessions {
       } finally { await fs.unlink(temp).catch(() => {}); }
       s.savedHash = digest(bytes);
       await this.writeBaseline(s);
+      s.saveState = 'source-saved';
       return { path: s.file, backupPath, sessionId: id, bytes: bytes.length };
-    });
+    }, options);
+  }
+  available(session) { if (session.closing) fail('SESSION_CLOSING', 'Session is closing'); }
+  /** Save the final participant's document, then release only its hosted context. */
+  async finish(id, token, lifecycle) {
+    const s = this.get(id); this.participant(s, token);
+    if (!lifecycle) fail('CLOSE_UNSUPPORTED', 'Editor lifecycle is unavailable');
+    if (s.participants.size !== 1 || s.pending.size || s.flights.size || [...s.participants.values()].some(p => p.activeCalls || p.waitingCalls) || s.saving || s.closing || s.blocked) fail('CLOSE_NOT_READY', 'Other participants or operations still use this session');
+    s.closing = true;
+    let committed = false;
+    try {
+      await lifecycle.prepare(id);
+      const saved = await this.save(id, token, { forClose: true });
+      await fs.mkdir(this.draftRoot, { recursive: true, mode: 0o700 });
+      await this.atomicWrite(`${s.draft}.closed`, Buffer.from('closed'));
+      committed = true;
+      await lifecycle.dispose(id);
+      s.participants.clear(); this.items.delete(id);
+      return { sessionId: id, path: s.file, closed: true, saved, rendererReleased: true };
+    } catch (error) {
+      if (committed) s.blocked = true;
+      else { s.closing = false; await lifecycle.resume(id); }
+      throw error;
+    }
   }
   persist(s, operation) {
     const result = s.persistTail.then(operation);

@@ -1,6 +1,6 @@
 {
   "name": "pencil",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "private": true,
   "type": "module",
   "engines": {
@@ -8,8 +8,8 @@
   },
   "scripts": {
     "build": "node scripts/build.mjs",
-    "test": "bun test tests/sessions.test.mjs tests/artifacts.test.mjs tests/manifest.test.mjs tests/startup.test.mjs tests/context.test.mjs --timeout 2000 && node --test --test-timeout=2000 tests/broker.test.mjs",
-    "test:protocol": "node tests/protocol.mjs",
+    "test": "bun test tests/sessions.test.mjs tests/artifacts.test.mjs tests/manifest.test.mjs tests/startup.test.mjs tests/context.test.mjs --timeout 2000 && node --test --test-timeout=2000 tests/broker.test.mjs && node --test --test-timeout=2000 tests/persistent-lifecycle.test.mjs",
+    "test:protocol": "node tests/protocol.mjs && node tests/persistent-protocol.mjs",
     "start": "node src/server.mjs",
     "preview": "node src/preview.mjs"
   },
@@ -20,7 +20,8 @@
     "zod": "4.6.7"
   },
   "devDependencies": {
-    "esbuild": "0.28.2"
+    "esbuild": "0.28.2",
+    "playwright-core": "1.65.1"
   },
   "license": "MIT",
   "repository": {

@@ -1,8 +1,8 @@
 {
   "name": "pencil",
   "displayName": "Pencil",
-  "version": "0.6.1",
-  "description": "Open .pen designs in the real Pencil editor through a local view, with one channel per design session and reservations so several agents can share it.",
+  "version": "0.7.0",
+  "description": "Persistent Pencil editor with per-session background rendering, shared agent participation, saved local drafts and explicit session completion.",
   "author": {
     "name": "Julien M"
   },
