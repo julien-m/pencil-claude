@@ -36601,7 +36601,7 @@ import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 
 // src/version.mjs
-var VERSION = "0.7.1";
+var VERSION = "0.7.3";
 
 // src/client.mjs
 var root = fileURLToPath(new URL("../", import.meta.url));

@@ -10,7 +10,7 @@
     {
       "name": "pencil",
       "description": "Persistent Pencil editor with background work, local drafts and explicit session completion.",
-      "version": "0.7.1",
+      "version": "0.7.3",
       "source": "./",
       "category": "design"
     }

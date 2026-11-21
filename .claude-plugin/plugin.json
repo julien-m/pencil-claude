@@ -1,7 +1,7 @@
 {
   "name": "pencil",
   "displayName": "Pencil",
-  "version": "0.7.1",
+  "version": "0.7.3",
   "description": "Persistent Pencil editor with per-session background rendering, shared agent participation, saved local drafts and explicit session completion.",
   "author": {
     "name": "Julien M"

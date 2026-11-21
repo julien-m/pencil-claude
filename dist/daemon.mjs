@@ -4455,7 +4455,7 @@ var Sessions = class {
 };
 
 // src/version.mjs
-var VERSION = "0.7.1";
+var VERSION = "0.7.3";
 
 // src/broker.mjs
 var same = (a, b) => {
